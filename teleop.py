@@ -1,15 +1,21 @@
 import os
 import sys
-import tempfile
 import subprocess
+import argparse
+import asyncio
+import base64
+import html
+import time
+from pathlib import Path
 from dataclasses import dataclass
+from typing import Callable, Iterable
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QFileDialog, QLineEdit, QTextEdit, QGroupBox, QFormLayout, QMessageBox,
     QSpinBox, QTabWidget, QListWidget, QListWidgetItem, QSlider, QGridLayout,
-    QComboBox
+    QComboBox, QCheckBox
 )
 
 from PyQt6.QtBluetooth import (
@@ -22,13 +28,169 @@ from PyQt6.QtBluetooth import (
 )
 
 
+try:
+    from PyQt6.QtWebEngineWidgets import QWebEngineView
+except Exception:
+    QWebEngineView = None
+
+
+# ============================================================
+# BLE code upload helpers
+# ============================================================
+NUS_SERVICE_UUID = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+NUS_TX_UUID = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"  # notify from robot
+NUS_RX_UUID = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"  # write to robot
+DEFAULT_EXTS = {".py", ".mpy", ".json", ".txt", ".cfg", ".ini"}
+
+
+class GuiBleCodeUploader:
+    def __init__(
+        self,
+        address: str,
+        chunk_size: int = 45,
+        timeout: float = 8.0,
+        log_cb: Callable[[str], None] | None = None,
+    ):
+        self.address = address
+        self.chunk_size = int(chunk_size)
+        self.timeout = float(timeout)
+        self.log_cb = log_cb or (lambda _msg: None)
+        self.client = None
+        self.queue: asyncio.Queue[str] = asyncio.Queue()
+
+    def _log(self, msg: str):
+        self.log_cb(str(msg))
+
+    async def __aenter__(self):
+        try:
+            from bleak import BleakClient
+        except Exception as e:
+            raise RuntimeError(
+                "BLE upload requires the 'bleak' package. Install it with: pip install bleak"
+            ) from e
+
+        self.client = BleakClient(self.address)
+        await self.client.connect()
+        await self.client.start_notify(NUS_TX_UUID, self._on_notify)
+        self._log(f"Connected to {self.address}")
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        try:
+            if self.client and self.client.is_connected:
+                await self.client.stop_notify(NUS_TX_UUID)
+        except Exception:
+            pass
+        try:
+            if self.client:
+                await self.client.disconnect()
+        except Exception:
+            pass
+
+    def _on_notify(self, _char, data: bytearray):
+        try:
+            text = bytes(data).decode(errors="ignore")
+        except Exception:
+            text = ""
+        for line in text.splitlines():
+            line = line.strip()
+            if line:
+                self._log(f"<- {line}")
+                self.queue.put_nowait(line)
+
+    async def _write_line(self, line: str):
+        if not self.client or not self.client.is_connected:
+            raise RuntimeError("BLE client is not connected")
+        payload = (line.strip() + "\n").encode()
+        self._log(f"-> {line}")
+        await self.client.write_gatt_char(NUS_RX_UUID, payload, response=False)
+
+    async def _wait_for(self, prefixes: Iterable[str]):
+        prefixes = tuple(prefixes)
+        while True:
+            line = await asyncio.wait_for(self.queue.get(), timeout=self.timeout)
+            if line.startswith("PUT_ERR"):
+                raise RuntimeError(line)
+            if line.startswith(prefixes):
+                return line
+
+    async def put_bytes(self, remote_path: str, data: bytes):
+        path_b64 = base64.b64encode(remote_path.encode()).decode()
+        await self._write_line(f"PUT_BEGIN {path_b64}")
+        await self._wait_for(("PUT_OK BEGIN",))
+
+        total = len(data)
+        sent = 0
+        while sent < total:
+            chunk = data[sent: sent + self.chunk_size]
+            chunk_b64 = base64.b64encode(chunk).decode()
+            await self._write_line(f"PUT_CHUNK {chunk_b64}")
+            sent += len(chunk)
+            if total:
+                pct = sent * 100.0 / total
+                self._log(f"   progress {sent}/{total} bytes ({pct:.1f}%)")
+            await asyncio.sleep(0.015)
+
+        await self._write_line("PUT_END")
+        await self._wait_for(("PUT_OK END",))
+
+    async def reboot(self):
+        await self._write_line("RESET")
+
+
+async def discover_ble_address(name_hint: str, timeout: float = 6.0, log_cb: Callable[[str], None] | None = None) -> str:
+    try:
+        from bleak import BleakScanner
+    except Exception as e:
+        raise RuntimeError(
+            "BLE upload requires the 'bleak' package. Install it with: pip install bleak"
+        ) from e
+
+    log = log_cb or (lambda _msg: None)
+    log(f"Scanning for BLE device matching: {name_hint}")
+    devices = await BleakScanner.discover(timeout=timeout)
+    matches = []
+    for dev in devices:
+        name = dev.name or ""
+        if name_hint.lower() in name.lower():
+            matches.append(dev)
+
+    if not matches:
+        raise RuntimeError(f"No BLE device found matching name: {name_hint}")
+
+    matches.sort(key=lambda d: getattr(d, "rssi", -999), reverse=True)
+    chosen = matches[0]
+    log(f"Found {chosen.name} @ {chosen.address}")
+    return chosen.address
+
+
+def gather_upload_files(source: Path, include_exts: set[str]) -> list[tuple[Path, str]]:
+    source = source.resolve()
+    files: list[tuple[Path, str]] = []
+
+    if source.is_file():
+        files.append((source, source.name))
+        return files
+
+    for path in sorted(source.rglob("*")):
+        if not path.is_file():
+            continue
+        if "__pycache__" in path.parts:
+            continue
+        if path.suffix.lower() not in include_exts:
+            continue
+        rel = path.relative_to(source).as_posix()
+        files.append((path, rel))
+    return files
+
+
 # ============================================================
 # Flash/Deploy worker
 # ============================================================
 @dataclass
 class Job:
     kind: str
-    port: str
+    port: str = ""
     firmware_path: str | None = None
     baud: int = 460800
     source_root: str = "."
@@ -37,6 +199,13 @@ class Job:
     right_pwm: int = 21
     right_dir: int = 22
     servo_gpio: int = 23
+    ble_address: str = ""
+    ble_name: str = "ZebraBot"
+    ble_source: str = "."
+    ble_dest_root: str = "/"
+    ble_chunk_size: int = 45
+    ble_reboot: bool = False
+    ble_exts: str = ",".join(sorted(DEFAULT_EXTS))
 
 
 class Worker(QThread):
@@ -98,39 +267,7 @@ class Worker(QThread):
                 if not os.path.isfile(main_src):
                     raise RuntimeError(f"main.py not found: {main_src}")
 
-                tmp = tempfile.mkdtemp(prefix="zebrabot_deploy_")
-                self.log.emit(f">> staging files from {source_root}")
-                self.log.emit(f">> temp dir: {tmp}")
-
-                staged_robot = os.path.join(tmp, "robot")
-                os.makedirs(staged_robot, exist_ok=True)
-
-                for name in os.listdir(robot_src):
-                    src_path = os.path.join(robot_src, name)
-                    dst_path = os.path.join(staged_robot, name)
-
-                    if os.path.isfile(src_path):
-                        with open(src_path, "r", encoding="utf-8") as f:
-                            text = f.read()
-
-                        if name == "config.py":
-                            text = self._patch_config_text(
-                                text,
-                                left_pwm=self.job.left_pwm,
-                                left_dir=self.job.left_dir,
-                                right_pwm=self.job.right_pwm,
-                                right_dir=self.job.right_dir,
-                                servo_gpio=self.job.servo_gpio,
-                            )
-
-                        with open(dst_path, "w", encoding="utf-8") as f:
-                            f.write(text)
-
-                staged_main = os.path.join(tmp, "main.py")
-                with open(main_src, "r", encoding="utf-8") as f:
-                    main_text = f.read()
-                with open(staged_main, "w", encoding="utf-8") as f:
-                    f.write(main_text)
+                self.log.emit(f">> deploying files from {source_root}")
 
                 def mp(*a: str) -> list[str]:
                     return [sys.executable, "-m", "mpremote", "connect", self.job.port, *a]
@@ -140,20 +277,61 @@ class Worker(QThread):
                 except Exception:
                     self.log.emit(">> (mkdir :/robot) exists or not supported; continuing...")
 
-                for name in os.listdir(staged_robot):
-                    local_path = os.path.join(staged_robot, name)
+                for name in sorted(os.listdir(robot_src)):
+                    local_path = os.path.join(robot_src, name)
                     if os.path.isfile(local_path):
                         self._run(mp("fs", "cp", local_path, f":/robot/{name}"), timeout=60)
 
-                self._run(mp("fs", "cp", staged_main, ":/main.py"), timeout=60)
+                self._run(mp("fs", "cp", main_src, ":/main.py"), timeout=60)
                 self._run(mp("reset"), timeout=30)
 
                 self.done.emit(True, "Deploy complete from local robot/ + main.py.")
+
+            elif self.job.kind == "ble_deploy":
+                asyncio.run(self._run_ble_deploy())
+                self.done.emit(True, "BLE code upload complete.")
             else:
                 raise RuntimeError(f"Unknown job kind: {self.job.kind}")
 
         except Exception as e:
             self.done.emit(False, str(e))
+
+    async def _run_ble_deploy(self):
+        source = Path(self.job.ble_source)
+        if not source.exists():
+            raise RuntimeError(f"Source does not exist: {source}")
+
+        include_exts = {
+            e.strip().lower() if e.strip().startswith('.') else '.' + e.strip().lower()
+            for e in self.job.ble_exts.split(',') if e.strip()
+        }
+        files = gather_upload_files(source, include_exts)
+        if not files:
+            raise RuntimeError("No matching files found to upload.")
+
+        dest_root = (self.job.ble_dest_root or "/").strip()
+        if not dest_root.startswith("/"):
+            dest_root = "/" + dest_root
+        dest_root = dest_root.rstrip("/") or "/"
+
+        address = self.job.ble_address.strip()
+        if not address:
+            address = await discover_ble_address(self.job.ble_name.strip() or "ZebraBot", log_cb=self.log.emit)
+
+        async with GuiBleCodeUploader(
+            address=address,
+            chunk_size=int(self.job.ble_chunk_size),
+            log_cb=self.log.emit,
+        ) as up:
+            for local_path, rel in files:
+                remote_path = (dest_root + "/" + rel).replace("//", "/")
+                data = local_path.read_bytes()
+                self.log.emit(f"Uploading {local_path} -> {remote_path}")
+                await up.put_bytes(remote_path, data)
+
+            if self.job.ble_reboot:
+                self.log.emit("Requesting robot reboot...")
+                await up.reboot()
 
     def _patch_config_text(
         self,
@@ -219,46 +397,53 @@ class FlashDeployTab(QWidget):
         fw_layout.addWidget(self.fw_path, 1)
         fw_layout.addWidget(self.btn_pick_fw)
 
-        g_cfg = QGroupBox("Robot Pin Config (used for deploy)")
-        cfg = QFormLayout(g_cfg)
-        self.left_pwm = QSpinBox()
-        self.left_pwm.setRange(0, 39)
-        self.left_pwm.setValue(18)
-        self.left_dir = QSpinBox()
-        self.left_dir.setRange(0, 39)
-        self.left_dir.setValue(19)
-        self.right_pwm = QSpinBox()
-        self.right_pwm.setRange(0, 39)
-        self.right_pwm.setValue(21)
-        self.right_dir = QSpinBox()
-        self.right_dir.setRange(0, 39)
-        self.right_dir.setValue(22)
-        self.servo_gpio = QSpinBox()
-        self.servo_gpio.setRange(0, 39)
-        self.servo_gpio.setValue(23)
+        g_deploy = QGroupBox("Code Deploy")
+        deploy = QFormLayout(g_deploy)
 
-        cfg.addRow("Left motor PWM GPIO:", self.left_pwm)
-        cfg.addRow("Left motor DIR GPIO:", self.left_dir)
-        cfg.addRow("Right motor PWM GPIO:", self.right_pwm)
-        cfg.addRow("Right motor DIR GPIO:", self.right_dir)
-        cfg.addRow("Steering servo GPIO:", self.servo_gpio)
+        self.deploy_method = QComboBox()
+        self.deploy_method.addItem("Serial (mpremote)", "serial")
+        self.deploy_method.addItem("Bluetooth LE (BLE)", "ble")
+        self.deploy_method.currentIndexChanged.connect(self.on_deploy_method_changed)
+
+        self.source_root = QLineEdit(os.path.dirname(os.path.abspath(__file__)))
+        self.btn_pick_source = QPushButton("Choose Project Folder…")
+        self.btn_pick_source.clicked.connect(self.pick_source_root)
+        source_row = QHBoxLayout()
+        source_row.addWidget(self.source_root, 1)
+        source_row.addWidget(self.btn_pick_source)
+
+        self.ble_name_edit = QLineEdit("ZebraBot")
+        self.ble_addr_edit = QLineEdit("")
+        self.ble_dest_root_edit = QLineEdit("/")
+        self.ble_chunk_spin = QSpinBox()
+        self.ble_chunk_spin.setRange(10, 180)
+        self.ble_chunk_spin.setValue(45)
+        self.ble_exts_edit = QLineEdit(",".join(sorted(DEFAULT_EXTS)))
+        self.ble_reboot_check = QCheckBox("Reboot robot after upload")
+
+        deploy.addRow("Upload Method:", self.deploy_method)
+        deploy.addRow("Project Root:", source_row)
+        deploy.addRow("BLE Name Hint:", self.ble_name_edit)
+        deploy.addRow("BLE Address (optional):", self.ble_addr_edit)
+        deploy.addRow("Robot Dest Root:", self.ble_dest_root_edit)
+        deploy.addRow("BLE Chunk Size:", self.ble_chunk_spin)
+        deploy.addRow("Include Extensions:", self.ble_exts_edit)
+        deploy.addRow("Options:", self.ble_reboot_check)
+
+        deploy_help = QLabel(
+            "Deploy uses the same local project root for both methods and expects a main.py file "
+            "plus a robot/ folder. Serial deploy now copies files as-is with no motor pin setup patching. "
+            "Choose Serial to copy with mpremote, or BLE to upload the same code set over Bluetooth."
+        )
+        deploy_help.setWordWrap(True)
 
         actions = QHBoxLayout()
         self.btn_flash = QPushButton("Erase + Flash Firmware")
-        self.btn_deploy = QPushButton("Deploy robot/ + main.py")
+        self.btn_deploy = QPushButton("Deploy main.py + robot/")
         self.btn_flash.clicked.connect(self.do_flash)
         self.btn_deploy.clicked.connect(self.do_deploy)
         actions.addWidget(self.btn_flash)
         actions.addWidget(self.btn_deploy)
-
-        g_src = QGroupBox("Source Files")
-        src_layout = QHBoxLayout(g_src)
-        self.source_root = QLineEdit(os.path.dirname(os.path.abspath(__file__)))
-        self.btn_pick_source = QPushButton("Choose Folder…")
-        self.btn_pick_source.clicked.connect(self.pick_source_root)
-        src_layout.addWidget(QLabel("Project Root:"))
-        src_layout.addWidget(self.source_root, 1)
-        src_layout.addWidget(self.btn_pick_source)
 
         self.log = QTextEdit()
         self.log.setReadOnly(True)
@@ -266,20 +451,34 @@ class FlashDeployTab(QWidget):
 
         layout.addWidget(g_conn)
         layout.addWidget(g_fw)
-        layout.addWidget(g_cfg)
-        layout.addWidget(g_src)
+        layout.addWidget(g_deploy)
+        layout.addWidget(deploy_help)
         layout.addLayout(actions)
         layout.addWidget(QLabel("Log:"))
         layout.addWidget(self.log, 1)
 
+        self.on_deploy_method_changed()
+
     def append_log(self, text: str):
         self.log.append(text)
+
+    def on_deploy_method_changed(self):
+        is_serial = self.deploy_method.currentData() == "serial"
+        self.port_edit.setEnabled(is_serial)
+        self.baud_spin.setEnabled(is_serial)
+        self.ble_name_edit.setEnabled(not is_serial)
+        self.ble_addr_edit.setEnabled(not is_serial)
+        self.ble_dest_root_edit.setEnabled(not is_serial)
+        self.ble_chunk_spin.setEnabled(not is_serial)
+        self.ble_exts_edit.setEnabled(not is_serial)
+        self.ble_reboot_check.setEnabled(not is_serial)
 
     def set_busy(self, busy: bool):
         self.btn_flash.setEnabled(not busy)
         self.btn_deploy.setEnabled(not busy)
         self.btn_pick_fw.setEnabled(not busy)
         self.btn_pick_source.setEnabled(not busy)
+        self.deploy_method.setEnabled(not busy)
 
     def pick_source_root(self):
         path = QFileDialog.getExistingDirectory(
@@ -329,12 +528,8 @@ class FlashDeployTab(QWidget):
         self._run_job(Job(kind="flash", port=port, firmware_path=fw, baud=baud))
 
     def do_deploy(self):
-        port = self.port_edit.text().strip()
+        method = self.deploy_method.currentData()
         source_root = self.source_root.text().strip()
-
-        if not port:
-            QMessageBox.warning(self, "Missing port", "Please enter a serial port (e.g., COM7).")
-            return
 
         if not source_root or not os.path.isdir(source_root):
             QMessageBox.warning(self, "Missing source root", "Please choose a valid project root.")
@@ -351,16 +546,29 @@ class FlashDeployTab(QWidget):
             QMessageBox.warning(self, "Missing main.py", f"Could not find:\n{main_py}")
             return
 
+        if method == "serial":
+            port = self.port_edit.text().strip()
+            if not port:
+                QMessageBox.warning(self, "Missing port", "Please enter a serial port (e.g., COM7).")
+                return
+
+            self._run_job(Job(
+                kind="deploy",
+                port=port,
+                baud=int(self.baud_spin.value()),
+                source_root=source_root,
+            ))
+            return
+
         self._run_job(Job(
-            kind="deploy",
-            port=port,
-            baud=int(self.baud_spin.value()),
-            source_root=source_root,
-            left_pwm=int(self.left_pwm.value()),
-            left_dir=int(self.left_dir.value()),
-            right_pwm=int(self.right_pwm.value()),
-            right_dir=int(self.right_dir.value()),
-            servo_gpio=int(self.servo_gpio.value()),
+            kind="ble_deploy",
+            ble_address=self.ble_addr_edit.text().strip(),
+            ble_name=self.ble_name_edit.text().strip() or "ZebraBot",
+            ble_source=source_root,
+            ble_dest_root=self.ble_dest_root_edit.text().strip() or "/",
+            ble_chunk_size=int(self.ble_chunk_spin.value()),
+            ble_reboot=bool(self.ble_reboot_check.isChecked()),
+            ble_exts=self.ble_exts_edit.text().strip() or ",".join(sorted(DEFAULT_EXTS)),
         ))
 
     def on_done(self, ok: bool, msg: str):
@@ -438,7 +646,6 @@ class BleTeleopTab(QWidget):
 
         self.devices = QListWidget()
 
-        # ---------------- IMU panel ----------------
         imu_box = QGroupBox("Live IMU Telemetry")
         imu_layout = QGridLayout(imu_box)
 
@@ -460,36 +667,41 @@ class BleTeleopTab(QWidget):
         imu_layout.addWidget(self.lbl_temp, 2, 0)
         imu_layout.addWidget(self.lbl_packets, 2, 1)
 
-        # ---------------- Sensor panel ----------------
-        sensor_box = QGroupBox("Sensor Ports (MUX 1-6)")
-        sensor_layout = QGridLayout(sensor_box)
+        self.sensor_box = QGroupBox("Live Sensor Dashboard")
+        sensor_outer = QVBoxLayout(self.sensor_box)
 
-        self.sensor_labels = {}
-        self.sensor_i2c_labels = {}
-        self.sensor_value_labels = {}
+        sensor_help = QLabel(
+            "Only connected and identified sensors are shown below. Unknown or unidentified ports remain hidden. Color sensors render a live swatch and TOF sensors show the latest distance reading."
+        )
+        sensor_help.setWordWrap(True)
+        sensor_outer.addWidget(sensor_help)
 
-        sensor_layout.addWidget(QLabel("Port"), 0, 0)
-        sensor_layout.addWidget(QLabel("Status"), 0, 1)
-        sensor_layout.addWidget(QLabel("I2C Addr(s)"), 0, 2)
-        sensor_layout.addWidget(QLabel("Value"), 0, 3)
+        self.sensor_rows_fallback = None
+        if QWebEngineView is not None:
+            self.sensor_web = QWebEngineView()
+            self.sensor_web.setMinimumHeight(240)
+            sensor_outer.addWidget(self.sensor_web, 1)
+        else:
+            self.sensor_web = None
+            self.sensor_rows_fallback = QTextEdit()
+            self.sensor_rows_fallback.setReadOnly(True)
+            self.sensor_rows_fallback.setMinimumHeight(240)
+            sensor_outer.addWidget(self.sensor_rows_fallback, 1)
 
-        for port in range(1, 7):
-            lbl_port = QLabel(str(port))
-            lbl_status = QLabel("unknown")
-            lbl_i2c = QLabel("--")
-            lbl_value = QLabel("--")
+        self.sensor_state = {
+            port: {
+                "status": "unknown",
+                "i2c": "--",
+                "kind": "",
+                "value": "--",
+                "rgb": (32, 32, 32),
+                "clear": None,
+                "last_update": 0.0,
+                "connected": False,
+            }
+            for port in range(1, 7)
+        }
 
-            self.sensor_labels[port] = lbl_status
-            self.sensor_i2c_labels[port] = lbl_i2c
-            self.sensor_value_labels[port] = lbl_value
-
-            row = port
-            sensor_layout.addWidget(lbl_port, row, 0)
-            sensor_layout.addWidget(lbl_status, row, 1)
-            sensor_layout.addWidget(lbl_i2c, row, 2)
-            sensor_layout.addWidget(lbl_value, row, 3)
-
-        # ---------------- Motor panel ----------------
         motor_box = QGroupBox("Motor Ports")
         motor_layout = QGridLayout(motor_box)
 
@@ -550,7 +762,6 @@ class BleTeleopTab(QWidget):
         motor_btn_row.addWidget(self.btn_motor_cfg)
         motor_btn_row.addWidget(self.btn_motor_state)
 
-        # ---------------- Individual motor test ----------------
         motor_test_box = QGroupBox("Individual Motor Test")
         motor_test_layout = QGridLayout(motor_test_box)
 
@@ -601,7 +812,7 @@ class BleTeleopTab(QWidget):
         root.addLayout(scan_row)
         root.addWidget(self.devices, 1)
         root.addWidget(imu_box)
-        root.addWidget(sensor_box)
+        root.addWidget(self.sensor_box)
         root.addWidget(motor_box)
         root.addLayout(motor_btn_row)
         root.addWidget(motor_test_box)
@@ -610,6 +821,12 @@ class BleTeleopTab(QWidget):
         root.addWidget(self.log_box, 1)
 
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+        self.sensor_timer = QTimer(self)
+        self.sensor_timer.setInterval(500)
+        self.sensor_timer.timeout.connect(self._refresh_sensor_dashboard)
+        self.sensor_timer.start()
+        self._refresh_sensor_dashboard()
 
         if not self.local_bt.isValid():
             self.status.setText("No usable local Bluetooth adapter found by Qt.")
@@ -621,11 +838,136 @@ class BleTeleopTab(QWidget):
         s.setValue(val)
         return s
 
+    def _sensor_card_html(self, port: int, state: dict) -> str:
+        status = html.escape(state.get("status", "unknown"))
+        i2c = html.escape(state.get("i2c", "--"))
+        kind = html.escape(state.get("kind") or "sensor")
+        value = html.escape(state.get("value", "--"))
+        rgb = state.get("rgb", (32, 32, 32))
+        if not isinstance(rgb, tuple) or len(rgb) != 3:
+            rgb = (32, 32, 32)
+        rgb = tuple(max(0, min(255, int(v))) for v in rgb)
+        active = (time.time() - float(state.get("last_update", 0.0))) < 2.0
+        dot_class = "dot active" if active else "dot stale"
+        active_text = "reporting" if active else "idle"
+
+        extra = f"<div class='kv'><span>Value</span><strong>{value}</strong></div>"
+        if state.get("kind") == "color":
+            clear_val = state.get("clear")
+            clear_txt = f"{int(clear_val)}" if clear_val is not None else "--"
+            extra += (
+                f"<div class='color-row'>"
+                f"<div class='color-box' style='background: rgb({rgb[0]}, {rgb[1]}, {rgb[2]});'></div>"
+                f"<div class='kv-stack'><div class='kv'><span>RGB</span><strong>{rgb[0]}, {rgb[1]}, {rgb[2]}</strong></div>"
+                f"<div class='kv'><span>Clear</span><strong>{clear_txt}</strong></div></div></div>"
+            )
+        elif state.get("kind") == "tof":
+            extra += f"<div class='distance'>{value}</div>"
+
+        return (
+            f"<div class='card'>"
+            f"<div class='head'><div><div class='port'>Port {port}</div><div class='kind'>{kind}</div></div>"
+            f"<div class='status'><span class='{dot_class}'></span>{active_text}</div></div>"
+            f"<div class='kv'><span>State</span><strong>{status}</strong></div>"
+            f"<div class='kv'><span>I2C</span><strong>{i2c}</strong></div>"
+            f"{extra}</div>"
+        )
+
+    def _sensor_is_displayable(self, state: dict) -> bool:
+        if not state.get("connected"):
+            return False
+        kind = (state.get("kind") or "").strip().lower()
+        status = (state.get("status") or "").strip().lower()
+        if not kind:
+            return False
+        if status in {"unknown", "empty", "unidentified"}:
+            return False
+        return True
+
+    def _refresh_sensor_dashboard(self):
+        cards = []
+        fallback_lines = []
+        visible_count = 0
+        for port in range(1, 7):
+            state = self.sensor_state[port]
+            if not self._sensor_is_displayable(state):
+                continue
+            visible_count += 1
+            cards.append(self._sensor_card_html(port, state))
+            fallback_lines.append(
+                f"Port {port} | {state.get('kind') or 'sensor'} | {state.get('status')} | {state.get('i2c')} | {state.get('value')}"
+            )
+
+        self.sensor_box.setVisible(visible_count > 0)
+
+        if not cards:
+            if self.sensor_web is not None:
+                self.sensor_web.setHtml("<html><body style='background:#11161d;'></body></html>")
+            elif self.sensor_rows_fallback is not None:
+                self.sensor_rows_fallback.clear()
+            return
+
+        page = f"""
+        <html><head><style>
+        body {{ background:#11161d; color:#e6edf3; font-family: Arial, sans-serif; margin:0; padding:10px; }}
+        .grid {{ display:grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap:10px; }}
+        .card {{ background:#18212b; border:1px solid #263444; border-radius:12px; padding:12px; box-shadow:0 4px 12px rgba(0,0,0,0.22); }}
+        .head {{ display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; }}
+        .port {{ font-size:16px; font-weight:700; color:#dce7f3; }}
+        .kind {{ font-size:12px; color:#8fa6bc; text-transform:uppercase; letter-spacing:0.08em; margin-top:2px; }}
+        .status {{ font-size:12px; color:#b8c7d6; display:flex; align-items:center; gap:6px; }}
+        .dot {{ width:10px; height:10px; border-radius:50%; display:inline-block; }}
+        .dot.active {{ background:#31c46c; box-shadow:0 0 10px rgba(49,196,108,0.7); }}
+        .dot.stale {{ background:#7b8794; }}
+        .kv, .distance {{ background:#121a22; border-radius:8px; padding:8px 10px; margin-top:8px; }}
+        .kv {{ display:flex; justify-content:space-between; gap:10px; }}
+        .kv span {{ color:#8fa6bc; }}
+        .kv strong, .distance {{ color:#f4f8fb; font-weight:700; }}
+        .color-row {{ display:flex; gap:10px; align-items:stretch; margin-top:8px; }}
+        .color-box {{ width:70px; min-width:70px; border-radius:10px; border:1px solid #3a4a5a; }}
+        .kv-stack {{ flex:1; display:flex; flex-direction:column; gap:8px; }}
+        .distance {{ text-align:center; font-size:24px; }}
+        .empty {{ border:1px dashed #3a4a5a; border-radius:12px; padding:20px; text-align:center; color:#8fa6bc; }}
+        </style></head><body><div class='grid'>{''.join(cards)}</div></body></html>"""
+        if self.sensor_web is not None:
+            self.sensor_web.setHtml(page)
+        elif self.sensor_rows_fallback is not None:
+            self.sensor_rows_fallback.setPlainText("\n".join(fallback_lines))
+
+    def _update_sensor_state(self, port: int, **updates):
+        if not (1 <= port <= 6):
+            return
+        state = self.sensor_state[port]
+        state.update(updates)
+        if updates.get("status") in {"empty", "unknown"}:
+            state["connected"] = False
+            state["kind"] = ""
+            state["value"] = "--"
+            state["i2c"] = "--"
+            state["last_update"] = 0.0
+        elif updates.get("status") == "unidentified":
+            state["connected"] = False
+            state["kind"] = ""
+            state["value"] = "--"
+            state["last_update"] = 0.0
+        elif updates:
+            state["connected"] = True
+            state["last_update"] = time.time()
+        self._refresh_sensor_dashboard()
+
     def _reset_sensor_rows(self):
         for port in range(1, 7):
-            self.sensor_labels[port].setText("unknown")
-            self.sensor_i2c_labels[port].setText("--")
-            self.sensor_value_labels[port].setText("--")
+            self.sensor_state[port] = {
+                "status": "unknown",
+                "i2c": "--",
+                "kind": "",
+                "value": "--",
+                "rgb": (32, 32, 32),
+                "clear": None,
+                "last_update": 0.0,
+                "connected": False,
+            }
+        self._refresh_sensor_dashboard()
 
     def _reset_motor_rows(self):
         for port in range(1, 7):
@@ -635,7 +977,6 @@ class BleTeleopTab(QWidget):
             self.motor_scan_ticks_labels[port].setText("--")
             self.motor_position_labels[port].setText("--")
 
-    # ---------------- Scan ----------------
     def start_scan(self):
         self.devices.clear()
         self.seen.clear()
@@ -699,7 +1040,6 @@ class BleTeleopTab(QWidget):
         self.btn_stop.setEnabled(False)
         self.status.setText(f"Scan error: {error}")
 
-    # ---------------- Connect ----------------
     def connect_selected(self):
         item = self.devices.currentItem()
         if not item:
@@ -859,7 +1199,6 @@ class BleTeleopTab(QWidget):
         if not parts:
             return
 
-        # ---------- IMU ----------
         if parts[0] == "IMU" and len(parts) >= 8:
             try:
                 ax = float(parts[1])
@@ -881,20 +1220,11 @@ class BleTeleopTab(QWidget):
                 self.log.emit(f"IMU parse error: {e}")
             return
 
-        # ---------- Sensors ----------
         if parts[0] == "SNS" and len(parts) >= 3:
             try:
                 port = int(parts[1])
                 state = parts[2]
-
-                if 1 <= port <= 6:
-                    self.sensor_labels[port].setText(state)
-
-                    if state == "empty":
-                        self.sensor_i2c_labels[port].setText("--")
-                        self.sensor_value_labels[port].setText("--")
-                    elif state == "unidentified":
-                        self.sensor_value_labels[port].setText("--")
+                self._update_sensor_state(port, status=state)
             except Exception as e:
                 self.log.emit(f"SNS parse error: {e}")
             return
@@ -903,8 +1233,7 @@ class BleTeleopTab(QWidget):
             try:
                 port = int(parts[1])
                 addrs = " ".join(parts[2:])
-                if 1 <= port <= 6:
-                    self.sensor_i2c_labels[port].setText(addrs)
+                self._update_sensor_state(port, i2c=addrs, connected=True)
             except Exception as e:
                 self.log.emit(f"SNS_I2C parse error: {e}")
             return
@@ -913,9 +1242,13 @@ class BleTeleopTab(QWidget):
             try:
                 port = int(parts[1])
                 dist_mm = int(parts[2])
-                if 1 <= port <= 6:
-                    self.sensor_labels[port].setText("UL53LDK")
-                    self.sensor_value_labels[port].setText(f"{dist_mm} mm")
+                self._update_sensor_state(
+                    port,
+                    status="ok",
+                    kind="tof",
+                    value=f"{dist_mm} mm",
+                    connected=True,
+                )
             except Exception as e:
                 self.log.emit(f"SNS_TOF parse error: {e}")
             return
@@ -927,9 +1260,15 @@ class BleTeleopTab(QWidget):
                 g = int(parts[3])
                 b = int(parts[4])
                 c = int(parts[5])
-                if 1 <= port <= 6:
-                    self.sensor_labels[port].setText("TCS3472")
-                    self.sensor_value_labels[port].setText(f"R{r} G{g} B{b} C{c}")
+                self._update_sensor_state(
+                    port,
+                    status="ok",
+                    kind="color",
+                    value=f"R{r} G{g} B{b}",
+                    rgb=(r, g, b),
+                    clear=c,
+                    connected=True,
+                )
             except Exception as e:
                 self.log.emit(f"SNS_COLOR parse error: {e}")
             return
@@ -938,14 +1277,11 @@ class BleTeleopTab(QWidget):
             try:
                 port = int(parts[1])
                 msg = " ".join(parts[2:])
-                if 1 <= port <= 6:
-                    self.sensor_labels[port].setText("error")
-                    self.sensor_value_labels[port].setText(msg)
+                self._update_sensor_state(port, status="error", kind="sensor", value=msg, connected=True)
             except Exception as e:
                 self.log.emit(f"SNS_ERR parse error: {e}")
             return
 
-        # ---------- Motors ----------
         if parts[0] == "MTR_CFG" and len(parts) >= 6:
             try:
                 port = int(parts[1])
@@ -965,18 +1301,15 @@ class BleTeleopTab(QWidget):
                 port = int(parts[1])
                 scan_power = parts[2]
                 scan_ticks = parts[3]
-
                 if 1 <= port <= 6:
                     self.motor_scan_power_labels[port].setText(str(scan_power))
                     self.motor_scan_ticks_labels[port].setText(str(scan_ticks))
-
                     try:
                         ticks_i = int(scan_ticks)
                         if ticks_i > 0 and self.motor_type_labels[port].text() == "unknown":
                             self.motor_type_labels[port].setText("motor+encoder?")
                     except Exception:
                         pass
-
                     if len(parts) >= 5:
                         self.motor_type_labels[port].setText(parts[4])
                     if len(parts) >= 6:
@@ -1050,7 +1383,6 @@ class BleTeleopTab(QWidget):
                 self.log.emit(f"MTR_ERR parse error: {e}")
             return
 
-        # ---------- General info ----------
         if parts[0] == "INFO":
             self.log.emit("[ROBOT] " + line[5:])
             return
@@ -1065,7 +1397,6 @@ class BleTeleopTab(QWidget):
 
         self.log.emit("[ROBOT RAW] " + line)
 
-    # ---------------- Writing commands ----------------
     def _write_line(self, line: str):
         if not self.nus_service or not self.rx_char or not self.rx_char.isValid():
             self.log.emit("Write skipped: RX characteristic not ready.")
@@ -1077,7 +1408,6 @@ class BleTeleopTab(QWidget):
             QLowEnergyService.WriteMode.WriteWithoutResponse
         )
 
-    # ---------------- UI handlers ----------------
     def on_motor_port_changed(self, _idx):
         self.selected_motor_port = int(self.motor_port_combo.currentData())
 
@@ -1101,14 +1431,24 @@ class BleTeleopTab(QWidget):
         self.log.emit(f"TX: MSTOP {port}")
 
 
-# ============================================================
-# Main App
-# ============================================================
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("teleopp - ZebraBot Flash/Deploy + BLE Motor Test")
-        self.resize(1180, 920)
+        self.setStyleSheet("""
+            QWidget { background: #10151c; color: #dce7f3; }
+            QGroupBox { border: 1px solid #283545; border-radius: 10px; margin-top: 12px; padding-top: 10px; font-weight: 600; background: #151d27; }
+            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; color: #9fc4ff; }
+            QPushButton { background: #1f2a36; border: 1px solid #304153; border-radius: 8px; padding: 8px 12px; }
+            QPushButton:hover { background: #283648; }
+            QPushButton:disabled { color: #6e7d8c; background: #18202a; }
+            QLineEdit, QTextEdit, QListWidget, QSpinBox, QComboBox { background: #0f141b; border: 1px solid #2d3a49; border-radius: 8px; padding: 6px; color: #e6edf3; }
+            QLabel { color: #dce7f3; }
+            QTabWidget::pane { border: 1px solid #283545; background: #10151c; }
+            QTabBar::tab { background: #18212b; color: #b9c8d6; padding: 8px 14px; border: 1px solid #283545; border-bottom: none; margin-right: 2px; border-top-left-radius: 8px; border-top-right-radius: 8px; }
+            QTabBar::tab:selected { background: #223041; color: #ffffff; }
+        """)
+        self.resize(1180, 960)
 
         root = QVBoxLayout(self)
         tabs = QTabWidget()
@@ -1121,13 +1461,16 @@ class MainWindow(QWidget):
 
         root.addWidget(tabs)
 
-        foot = QLabel("Tip: After Deploy, power-cycle the robot and then scan/connect in the BLE tab.")
+        foot = QLabel(
+            "Tip: BLE upload is for user code files only. Firmware flashing still uses the serial tab controls."
+        )
         foot.setWordWrap(True)
         root.addWidget(foot)
 
 
 def main():
     app = QApplication(sys.argv)
+    app.setStyle("Fusion")
     w = MainWindow()
     w.show()
     sys.exit(app.exec())
