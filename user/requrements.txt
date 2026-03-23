@@ -1,0 +1,24 @@
+# BLE communication
+bleak>=0.21.0
+
+# Serial / ESP32 communication
+pyserial>=3.5
+
+# MicroPython tooling
+mpremote>=1.22.0
+
+# UI (PyQt + Web UI embedding)
+PyQt6>=6.6.0
+PyQt6-WebEngine>=6.6.0
+
+# Optional UI enhancements (recommended)
+PyQt6-Qt6>=6.6.0
+
+# Data handling / JSON (host side)
+orjson>=3.9.0
+
+# CLI / logging improvements (optional but useful)
+rich>=13.7.0
+
+# Async utilities (sometimes useful with BLE + UI bridging)
+async-timeout>=4.0.3
