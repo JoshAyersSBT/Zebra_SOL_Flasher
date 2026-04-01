@@ -1,5 +1,6 @@
 # robot/ble_teleop.py
 import os
+import sys
 import bluetooth
 import uasyncio as asyncio
 import ubinascii
@@ -41,6 +42,13 @@ def _adv_payload(name=None, services=None):
     payload = bytearray()
     payload = _append_adv_field(payload, 0x01, b"\x06")
 
+    if name:
+        nb = name.encode()
+        if len(nb) > 16:
+            payload = _append_adv_field(payload, 0x08, nb[:16])
+        else:
+            payload = _append_adv_field(payload, 0x09, nb)
+
     if services:
         svc128 = bytearray()
         for svc in services:
@@ -49,13 +57,6 @@ def _adv_payload(name=None, services=None):
                 svc128 += b
         if svc128:
             payload = _append_adv_field(payload, 0x07, svc128)
-
-    if name:
-        nb = name.encode()
-        if len(nb) > 20:
-            payload = _append_adv_field(payload, 0x08, nb[:20])
-        else:
-            payload = _append_adv_field(payload, 0x09, nb)
 
     return bytes(payload)
 
@@ -117,27 +118,29 @@ class BleTeleop:
 
         self._oled_msg_task = None
 
+        # outbound BLE notification queue
+        self._tx_queue = []
+        self._tx_queue_max = 80
+        self._tx_drop_count = 0
+
         self.steering.angle(SERVO_CENTER_DEG)
 
-        self._adv_data = _adv_payload(None, services=[_UART_UUID])
-        self._resp_data = _adv_payload(BLE_NAME)
+        self._adv_data = _adv_payload(BLE_NAME, services=[_UART_UUID])
         self._advertise()
 
         try:
             asyncio.create_task(self._housekeeping())
+            asyncio.create_task(self._tx_task())
         except Exception as e:
-            print("BLE housekeeping start failed:", e)
+            print("BLE task start failed:", e)
 
     def _advertise(self):
         self._conn_handle = None
         try:
-            self._ble.gap_advertise(100_000, adv_data=self._adv_data, resp_data=self._resp_data)
+            self._ble.gap_advertise(100_000, adv_data=self._adv_data)
             print("BLE advertising as:", BLE_NAME)
         except Exception as e:
             print("BLE advertise failed:", e)
-
-        # Do not overwrite the OLED here.
-        # The user program or main runtime should own the display.
 
     def _cancel_oled_msg(self):
         try:
@@ -183,6 +186,59 @@ class BleTeleop:
 
             await asyncio.sleep_ms(50)
 
+    async def _tx_task(self):
+        while True:
+            try:
+                if self._conn_handle is None or not self._tx_queue:
+                    await asyncio.sleep_ms(20)
+                    continue
+
+                text = self._tx_queue.pop(0)
+                try:
+                    self._ble.gatts_notify(self._conn_handle, self._tx_handle, text.encode() + b"\n")
+                except Exception:
+                    if self._conn_handle is not None:
+                        self._tx_queue.insert(0, text)
+                    await asyncio.sleep_ms(50)
+                    continue
+
+                await asyncio.sleep_ms(12)
+            except Exception:
+                await asyncio.sleep_ms(50)
+
+    def _queue_notify(self, text: str):
+        try:
+            text = str(text)
+        except Exception:
+            text = "<notify encode error>"
+
+        if len(self._tx_queue) >= self._tx_queue_max:
+            self._tx_drop_count += 1
+            self._tx_queue.pop(0)
+
+        self._tx_queue.append(text)
+
+    def _serial_write(self, text: str):
+        try:
+            print(str(text))
+        except Exception:
+            pass
+
+    def _serial_exception(self, tag: str, exc):
+        try:
+            self._serial_write("ERR " + str(tag))
+            sys.print_exception(exc)
+        except Exception:
+            try:
+                self._serial_write("ERR {} {}".format(tag, repr(exc)))
+            except Exception:
+                pass
+
+    def _broadcast_line(self, text: str):
+        text = str(text)
+        self._serial_write(text)
+        self._notify(text)
+
     def _on_connected(self):
         print("BLE connected")
         self.notify_info("BLE connected")
@@ -192,9 +248,12 @@ class BleTeleop:
         except Exception as e:
             self.notify_error("BOOT_LOG", e)
 
+        if self._tx_drop_count:
+            self.notify_line("WARN TX dropped {}".format(self._tx_drop_count))
+            self._tx_drop_count = 0
+
         if self.oled:
             try:
-                # Keep the visual feedback brief, then release the display.
                 self.oled.flash_connected()
                 try:
                     asyncio.create_task(self._clear_oled_after_connect())
@@ -209,7 +268,6 @@ class BleTeleop:
 
     async def _clear_oled_after_connect(self):
         try:
-            # flash_connected() takes about 800 ms, then writes "BLE Connected"
             await asyncio.sleep_ms(1800)
             if self.oled:
                 self.oled.clear()
@@ -231,9 +289,9 @@ class BleTeleop:
             self.notify_error("STEER_CENTER", e)
 
         if self.oled:
-            # Brief disconnect notice only, do not permanently own the display.
             self._oled_temp_message("ZebraBot", "Disconnected", hold_ms=700, clear_after=True)
 
+        self._tx_queue = []
         self._advertise()
 
     def _irq(self, event, data):
@@ -276,21 +334,23 @@ class BleTeleop:
                 self.notify_error("RX_CMD", e)
 
     def _notify(self, text: str):
+        # TX characteristic only; never write to RX.
         if self._conn_handle is None:
             return
-        try:
-            self._ble.gatts_notify(self._conn_handle, self._tx_handle, text.encode() + b"\n")
-        except Exception:
-            pass
+        self._queue_notify(text)
 
     def notify_line(self, text: str):
-        self._notify(str(text))
+        self._broadcast_line(str(text))
 
     def notify_info(self, msg: str):
         for line in split_lines(str(msg), max_len=120):
-            self._notify("INFO " + line)
+            self._broadcast_line("INFO " + line)
 
     def notify_error(self, tag: str, exc):
+        # Always print the full traceback to USB/serial first.
+        self._serial_exception(tag, exc)
+
+        # Then try a BLE-friendly summarized version.
         try:
             self._notify("ERR " + str(tag))
             for line in split_lines(exc_to_string(exc), max_len=120):

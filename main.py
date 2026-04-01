@@ -35,7 +35,6 @@ from robot.debug_io import (
     replay_boot_log,
 )
 
-
 SAFE_MODE_PIN = 0
 BOOT_GRACE_SECONDS = 3
 
@@ -61,10 +60,8 @@ class RobotAPI:
         }
         self.handles = {}
         self.tasks = {}
+        self._oled_user_hold_until = 0
 
-    # -------------------------
-    # runtime registration
-    # -------------------------
     def register_handle(self, name, value):
         self.handles[name] = value
         return value
@@ -76,9 +73,6 @@ class RobotAPI:
         self.tasks[name] = task
         return task
 
-    # -------------------------
-    # system state
-    # -------------------------
     def set_ready(self, ready=True):
         self.status["system"]["ready"] = bool(ready)
 
@@ -88,9 +82,18 @@ class RobotAPI:
     def get_services(self):
         return self.status.get("services", {})
 
-    # -------------------------
-    # motor API
-    # -------------------------
+    def mark_user_display(self, hold_ms=2500):
+        try:
+            self._oled_user_hold_until = time.ticks_add(time.ticks_ms(), int(hold_ms))
+        except Exception:
+            self._oled_user_hold_until = 0
+
+    def user_display_active(self):
+        try:
+            return time.ticks_diff(self._oled_user_hold_until, time.ticks_ms()) > 0
+        except Exception:
+            return False
+
     def list_motor_ports(self):
         return sorted(self.handles.get("motors", {}).keys())
 
@@ -156,9 +159,6 @@ class RobotAPI:
         }
         return self.status["drive"]
 
-    # -------------------------
-    # steering API
-    # -------------------------
     def set_steering(self, angle):
         steer = self.handles.get("steer")
         if steer is None:
@@ -172,9 +172,6 @@ class RobotAPI:
         }
         return self.status["steering"]
 
-    # -------------------------
-    # sensor API
-    # -------------------------
     def publish_sensor(self, name, value, meta=None):
         item = {
             "value": value,
@@ -213,9 +210,6 @@ class RobotAPI:
             }
             return None
 
-    # -------------------------
-    # display / transport helpers
-    # -------------------------
     def notify(self, msg):
         teleop = self.handles.get("teleop")
         if teleop is not None:
@@ -231,6 +225,7 @@ class RobotAPI:
         if oled is None:
             return False
         try:
+            self.mark_user_display()
             oled.show_lines(*lines)
             return True
         except Exception as e:
@@ -239,12 +234,6 @@ class RobotAPI:
 
 
 class _ZBotSensor:
-    """
-    Simple student-facing sensor wrapper.
-
-    Currently focused on ToF distance style access from the shared sensor snapshot.
-    """
-
     def __init__(self, api, port):
         self.api = api
         self.port = int(port)
@@ -252,7 +241,6 @@ class _ZBotSensor:
     def _find_snapshot_value(self):
         sensors = self.api.get_sensor_snapshot()
 
-        # Preferred simple key
         key = "tof_port_{}".format(self.port)
         item = sensors.get(key)
         if isinstance(item, dict):
@@ -260,7 +248,6 @@ class _ZBotSensor:
             if isinstance(value, (int, float)):
                 return int(value)
 
-        # Fallbacks for slightly different snapshot naming
         fallback_keys = (
             "port{}_tof".format(self.port),
             "tof_{}".format(self.port),
@@ -274,7 +261,6 @@ class _ZBotSensor:
                 if isinstance(value, (int, float)):
                     return int(value)
 
-        # Generic fallback using meta
         for key, item in sensors.items():
             if not isinstance(item, dict):
                 continue
@@ -297,16 +283,9 @@ class _ZBotSensor:
 
     def read(self):
         return self._find_snapshot_value()
+
+
 class _ZBotMotor:
-    """
-    Simple student-facing motor wrapper.
-
-    Intended usage:
-        m = zbot.motors(1, "DC")
-        m.on(60)
-        m.off()
-    """
-
     def __init__(self, api, port, motor_type="DC"):
         self.api = api
         self.port = int(port)
@@ -356,25 +335,8 @@ class _ZBotMotor:
         except Exception:
             return None
 
+
 class ZBot:
-    """
-    Small teaching API layered on top of the full robot runtime.
-
-    Intended student usage:
-        from main import zbot
-
-        tof = zbot.sensor(1)
-        d = tof.read()
-
-        motor = zbot.motors(1, "DC")
-        motor.on(60)
-        motor.off()
-
-        zbot.forward(60)
-        zbot.stop()
-        zbot.display("HELLO")
-    """
-
     def __init__(self, api=None):
         self.api = api
         self._motor_wrappers = {}
@@ -386,9 +348,6 @@ class ZBot:
     def ready(self):
         return self.api is not None and bool(self.api.status["system"].get("ready", False))
 
-    # -------------------------
-    # movement
-    # -------------------------
     def forward(self, power=50):
         if self.api is None:
             return False
@@ -414,9 +373,6 @@ class ZBot:
         self.api.stop_all()
         return True
 
-    # -------------------------
-    # individual motors
-    # -------------------------
     def motors(self, port, motor_type="DC"):
         key = (int(port), str(motor_type))
         if self.api is None:
@@ -430,9 +386,6 @@ class ZBot:
     def motor(self, port, motor_type="DC"):
         return self.motors(port, motor_type)
 
-    # -------------------------
-    # display
-    # -------------------------
     def display(self, line1="", line2=""):
         if self.api is None:
             return False
@@ -441,9 +394,6 @@ class ZBot:
     def say(self, line1="", line2=""):
         return self.display(line1, line2)
 
-    # -------------------------
-    # sensors
-    # -------------------------
     def sensor(self, port):
         if self.api is None:
             return _ZBotSensor(None, port)
@@ -453,9 +403,6 @@ class ZBot:
         s = self.sensor(port)
         return s.read()
 
-    # -------------------------
-    # utilities
-    # -------------------------
     def status(self):
         if self.api is None:
             return {}
@@ -475,12 +422,56 @@ class ZBot:
         if self.api is None:
             return {}
         return self.api.get_motor_feedback()
+
+
 def get_api():
     return API
 
 
 def get_zbot():
     return zbot
+
+
+def _boot_oled(api, line1, line2="", line3=""):
+    try:
+        oled = api.get_handle("oled")
+        if oled is not None and getattr(oled, "available", False):
+            oled.show_lines(line1, line2, line3)
+    except Exception as e:
+        error("BOOT_OLED", e)
+
+
+def _format_tof_line(api):
+    sensors = api.status.get("sensors", {})
+    for port in range(1, 7):
+        key = "tof_port_{}".format(port)
+        item = sensors.get(key)
+        if isinstance(item, dict):
+            value = item.get("value")
+            if isinstance(value, (int, float)):
+                return "TOF{}: {}mm".format(port, int(value))
+    return "TOF: --"
+
+
+def _format_user_line(api):
+    user = api.status.get("user", {})
+    if user.get("last_error"):
+        return "User ERR"
+    if user.get("running"):
+        return "User: running"
+    return "User: idle"
+
+
+def _format_ble_line(api):
+    teleop = api.get_handle("teleop")
+    if teleop is None:
+        return "BLE: off"
+    try:
+        if teleop._conn_handle is None:
+            return "BLE: waiting"
+        return "BLE: connected"
+    except Exception:
+        return "BLE: ?"
 
 
 async def _api_housekeeping_task(api):
@@ -507,21 +498,86 @@ async def _api_housekeeping_task(api):
         await asyncio.sleep_ms(100)
 
 
+async def _oled_status_task(api):
+    last_lines = None
+
+    while True:
+        try:
+            oled = api.get_handle("oled")
+            if oled is None or not getattr(oled, "available", False):
+                await asyncio.sleep_ms(500)
+                continue
+
+            if api.user_display_active():
+                await asyncio.sleep_ms(200)
+                continue
+
+            line1 = "ZebraBot Ready" if api.status["system"].get("ready") else "ZebraBot Boot"
+            line2 = _format_ble_line(api)
+            line3 = _format_user_line(api)
+            line4 = _format_tof_line(api)
+
+            lines = (line1, line2, line3, line4)
+            if lines != last_lines:
+                oled.show_lines(*lines)
+                last_lines = lines
+
+        except Exception as e:
+            error("OLED_STATUS_TASK", e)
+
+        await asyncio.sleep_ms(300)
+
+
+async def _boot_complete_message(api):
+    _boot_oled(api, "ZebraBot", "Boot Complete", "Starting tasks...")
+    await asyncio.sleep_ms(1200)
+
+
 async def _run_user_program(api):
+    teleop = api.get_handle("teleop")
+
     try:
         import user_main
     except Exception as e:
         error("USER_IMPORT", e)
         api.status["user"]["last_error"] = repr(e)
+
+        if teleop is not None:
+            try:
+                teleop.notify_error("USER_IMPORT", e)
+            except Exception:
+                pass
+
+        try:
+            api.show_lines("User Import Err", "See BLE log")
+        except Exception:
+            pass
         return
 
     user_fn = getattr(user_main, "main", None)
     if user_fn is None:
         warn("USER: user_main.main missing")
+
+        if teleop is not None:
+            try:
+                teleop.notify_line("ERR USER main() missing")
+            except Exception:
+                pass
+
+        try:
+            api.show_lines("User Error", "main() missing")
+        except Exception:
+            pass
         return
 
     api.status["user"]["running"] = True
     api.status["user"]["last_error"] = None
+
+    if teleop is not None:
+        try:
+            teleop.notify_line("INFO USER main starting")
+        except Exception:
+            pass
 
     try:
         argc = None
@@ -530,9 +586,6 @@ async def _run_user_program(api):
         except Exception:
             pass
 
-        # Support both:
-        #   async def main():
-        #   async def main(api):
         if argc == 0:
             await user_fn()
         else:
@@ -541,9 +594,26 @@ async def _run_user_program(api):
     except Exception as e:
         api.status["user"]["last_error"] = repr(e)
         error("USER_MAIN", e)
+
+        if teleop is not None:
+            try:
+                teleop.notify_error("USER_MAIN", e)
+            except Exception:
+                pass
+
+        try:
+            api.show_lines("User Error", "See BLE log", str(type(e).__name__))
+        except Exception:
+            pass
+
     finally:
         api.status["user"]["running"] = False
 
+        if teleop is not None:
+            try:
+                teleop.notify_line("INFO USER main stopped")
+            except Exception:
+                pass
 
 async def main():
     global API
@@ -564,17 +634,12 @@ async def main():
 
     api = RobotAPI()
     API = api
-
-    # bind student-facing wrapper immediately
     zbot = ZBot(api)
 
     info("BOOT: starting robot init")
     state("BOOT", "start")
     api.status["boot"]["state"] = "starting"
 
-    # -------------------------
-    # Motors / drivetrain
-    # -------------------------
     try:
         for port in sorted(MOTOR_PORT_MAP.keys()):
             cfg = MOTOR_PORT_MAP[port]
@@ -616,9 +681,6 @@ async def main():
         error("MOTOR_INIT", e)
         raise
 
-    # -------------------------
-    # Steering servo
-    # -------------------------
     try:
         steer = Servo(
             STEER_SERVO_GPIO,
@@ -635,9 +697,6 @@ async def main():
         error("SERVO_INIT", e)
         raise
 
-    # -------------------------
-    # Base I2C + TCA9548A mux
-    # -------------------------
     try:
         base_i2c = I2C(
             TCA_I2C_ID,
@@ -670,9 +729,6 @@ async def main():
     except Exception as e:
         error("TCA_INIT", e)
 
-    # -------------------------
-    # MPU-6050 on mux channel
-    # -------------------------
     try:
         imu = MPU6050(
             i2c_id=TCA_I2C_ID,
@@ -692,9 +748,6 @@ async def main():
         imu = None
         warn("BOOT: MPU unavailable")
 
-    # -------------------------
-    # OLED on mux channel
-    # -------------------------
     try:
         oled = OledStatus(
             i2c_id=TCA_I2C_ID,
@@ -708,7 +761,7 @@ async def main():
         )
         if oled and oled.available:
             api.register_handle("oled", oled)
-            oled.show_lines("ZebraBot", "Booting...")
+            oled.show_lines("ZebraBot", "Booting...", "OLED online")
             info("BOOT: OLED initialized")
             diag("OLED CH={} ADDR={}".format(OLED_CHANNEL, hex(OLED_ADDR)))
             state("BOOT", "oled_ok")
@@ -719,9 +772,8 @@ async def main():
         error("OLED_INIT", e)
         oled = None
 
-    # -------------------------
-    # BLE interface layer
-    # -------------------------
+    _boot_oled(api, "ZebraBot", "Starting BLE", "")
+
     try:
         teleop = BleTeleop(
             drive=drive,
@@ -738,11 +790,11 @@ async def main():
         state("BOOT", "ble_ok")
     except Exception as e:
         error("BLE_INIT", e)
+        _boot_oled(api, "ZebraBot", "BLE init fail", str(type(e).__name__))
         raise
 
-    # -------------------------
-    # Sensor hub (mux channels 1..6)
-    # -------------------------
+    _boot_oled(api, "ZebraBot", "Starting sensors", "")
+
     try:
         notify_fn = teleop.notify_line if teleop is not None else None
         sensor_hub = SensorHub(
@@ -762,9 +814,8 @@ async def main():
         error("SENSOR_HUB_INIT", e)
         sensor_hub = None
 
-    # -------------------------
-    # Motor feedback + scan
-    # -------------------------
+    _boot_oled(api, "ZebraBot", "Starting motors", "")
+
     try:
         motor_port_map = dict(MOTOR_PORT_MAP)
         motor_feedback = MotorFeedback(motor_port_map)
@@ -800,9 +851,8 @@ async def main():
     api.status["boot"]["state"] = "complete"
     api.set_ready(True)
 
-    # -------------------------
-    # Background tasks
-    # -------------------------
+    await _boot_complete_message(api)
+
     if sensor_hub is not None:
         try:
             api.register_task("sensor_hub", asyncio.create_task(sensor_hub.task()))
@@ -812,12 +862,17 @@ async def main():
             error("SENSOR_HUB_TASK", e)
 
     if imu is not None and teleop is not None:
-        try:
-            api.register_task("imu", asyncio.create_task(teleop.imu_task()))
-            info("BOOT: IMU task started")
-            state("TASK", "imu_started")
-        except Exception as e:
-            error("IMU_TASK_START", e)
+        imu_task_fn = getattr(teleop, "imu_task", None)
+        if imu_task_fn is not None:
+            try:
+                api.register_task("imu", asyncio.create_task(imu_task_fn()))
+                info("BOOT: IMU task started")
+                state("TASK", "imu_started")
+            except Exception as e:
+                error("IMU_TASK_START", e)
+        else:
+            warn("BOOT: teleop.imu_task missing")
+            state("TASK", "imu_missing")
     else:
         info("BOOT: IMU task skipped (no IMU)")
         state("TASK", "imu_skipped")
@@ -850,15 +905,19 @@ async def main():
         error("API_HOUSEKEEPING", e)
 
     try:
+        api.register_task("oled_status", asyncio.create_task(_oled_status_task(api)))
+        info("BOOT: OLED status task started")
+        state("TASK", "oled_status_started")
+    except Exception as e:
+        error("OLED_STATUS_START", e)
+
+    try:
         api.register_task("user_main", asyncio.create_task(_run_user_program(api)))
         info("BOOT: user_main task started")
         state("TASK", "user_main_started")
     except Exception as e:
         error("USER_TASK_START", e)
 
-    # -------------------------
-    # Idle loop / heartbeat
-    # -------------------------
     while True:
         api.status["system"]["heartbeat"] += 1
         state("SYS", "heartbeat")
