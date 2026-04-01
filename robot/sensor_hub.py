@@ -1,8 +1,6 @@
-# robot/sensor_hub.py
 from machine import I2C, Pin
 import uasyncio as asyncio
 from robot.debug_io import info, error
-import time
 
 from robot import vl53l1x
 try:
@@ -71,7 +69,59 @@ class SensorHub:
         self._tof = {}
         self._color = {}
         self._last_value = {}
-        self._retry_div = {}  # slow down reprobe on unidentified devices
+        self._retry_div = {}
+
+    def snapshot(self):
+        """
+        Return a simple shared sensor snapshot for user programs.
+
+        Main student-facing keys:
+            tof_port_1 = {"value": 123, "meta": {...}}
+            color_port_2 = {"value": {"r":...,"g":...,"b":...,"clear":...}, "meta": {...}}
+            port_1_state = {"value": "VL53L0X", "meta": {"port": 1}}
+        """
+        out = {}
+
+        for port in range(1, 7):
+            state_name = self._cache_state.get(port)
+            addrs = self._cache_addrs.get(port, ())
+            out["port_{}_state".format(port)] = {
+                "value": state_name if state_name is not None else "unknown",
+                "meta": {
+                    "port": port,
+                    "addrs": [int(a) for a in addrs] if addrs else [],
+                },
+            }
+
+        for (kind, port), value in self._last_value.items():
+            if kind in ("VL53L1X", "VL53L0X"):
+                if isinstance(value, (int, float)):
+                    out["tof_port_{}".format(port)] = {
+                        "value": int(value),
+                        "meta": {
+                            "kind": kind,
+                            "port": port,
+                            "unit": "mm",
+                        },
+                    }
+
+            elif kind == "TCS3472":
+                if isinstance(value, tuple) and len(value) == 4:
+                    r, g, b, clear = value
+                    out["color_port_{}".format(port)] = {
+                        "value": {
+                            "r": int(r),
+                            "g": int(g),
+                            "b": int(b),
+                            "clear": int(clear),
+                        },
+                        "meta": {
+                            "kind": kind,
+                            "port": port,
+                        },
+                    }
+
+        return out
 
     def _select(self, port):
         if self.mux is None:
@@ -111,7 +161,6 @@ class SensorHub:
             if 0x29 not in addrs:
                 return False
 
-            # explicit ID probe
             chip_id = self.i2c.readfrom_mem(0x29, 0x92, 1)[0]
             if chip_id not in (0x44, 0x4D):
                 self._notify("SNS_DBG {} tcs_id {}".format(port, hex(chip_id)))
@@ -127,7 +176,6 @@ class SensorHub:
             return False
 
     def _read_tof_distance(self, sensor):
-        # Common driver shapes across MicroPython ports
         if hasattr(sensor, "read"):
             return int(sensor.read())
         if hasattr(sensor, "distance"):
@@ -169,14 +217,8 @@ class SensorHub:
                 )
             )
 
-            # Keep the sensor instance even if the current candidate is bad.
-            # This lets us continue debugging in _poll_tof().
             self._tof[port] = ("VL53L1X", sensor)
-
-            # Use cand_96 as the current working candidate, but do not require it
-            # to be valid during identification.
             self._last_value[("VL53L1X", port)] = sample["cand_96"]
-
             return True
 
         except Exception as e:
@@ -213,6 +255,7 @@ class SensorHub:
         except Exception as e:
             self._notify("SNS_DBG {} vl53l0x_probe {}".format(port, e))
             return False
+
     def _identify(self, port, addrs):
         if not addrs:
             return "empty"
@@ -221,9 +264,6 @@ class SensorHub:
             port,
             ",".join(hex(a) for a in addrs)
         ))
-
-        # Focus on ToF first, because shared 0x29 devices can otherwise
-        # get claimed by the wrong probe order.
 
         if self._try_vl53l0x(port):
             return "VL53L0X"
@@ -276,13 +316,11 @@ class SensorHub:
                     )
                 )
 
-                # For now, pick one candidate to publish only if it looks sane.
                 dist = sample["cand_96"]
 
                 if dist <= 0 or dist >= 4000 or dist == 65535:
                     self._notify("SNS_ERR {} {} invalid {}".format(port, kind, dist))
                     return
-
             else:
                 dist = self._read_tof_distance(sensor)
 
@@ -295,7 +333,6 @@ class SensorHub:
             error("{}_POLL_{}".format(kind, port), e)
             self._notify("SNS_ERR {} {} poll failed".format(port, kind))
             self._clear_port(port)
-
 
     def _poll_port(self, port):
         addrs = self._scan(port)
@@ -316,7 +353,6 @@ class SensorHub:
             return
 
         if state_name == "unidentified":
-            # retry full identify only every 10 scans
             self._retry_div[port] = self._retry_div.get(port, 0) + 1
             if addrs:
                 self._notify("SNS_I2C {} {}".format(

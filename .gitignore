@@ -1,0 +1,7 @@
+# PyInstaller
+build/
+dist/
+*.spec
+
+# user projects
+projects/

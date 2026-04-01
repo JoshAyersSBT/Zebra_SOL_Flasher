@@ -19,11 +19,9 @@ _IRQ_CENTRAL_DISCONNECT = const(2)
 _IRQ_GATTS_WRITE = const(3)
 
 
-
 def _append_adv_field(payload, adv_type, value):
     payload += bytes((len(value) + 1, adv_type)) + value
     return payload
-
 
 
 def _uuid_bytes(uuid_obj):
@@ -34,10 +32,9 @@ def _uuid_bytes(uuid_obj):
         if len(s) == 32:
             out = bytearray()
             for i in range(0, 32, 2):
-                out.append(int(s[i : i + 2], 16))
+                out.append(int(s[i:i + 2], 16))
             return bytes(out)
         return b""
-
 
 
 def _adv_payload(name=None, services=None):
@@ -63,13 +60,11 @@ def _adv_payload(name=None, services=None):
     return bytes(payload)
 
 
-
 def _dirname(path):
     i = path.rfind("/")
     if i <= 0:
         return "/" if path.startswith("/") else ""
     return path[:i]
-
 
 
 def _mkdirs(path):
@@ -120,11 +115,14 @@ class BleTeleop:
         self._upload_tmp = None
         self._upload_fp = None
 
+        self._oled_msg_task = None
+
         self.steering.angle(SERVO_CENTER_DEG)
 
         self._adv_data = _adv_payload(None, services=[_UART_UUID])
         self._resp_data = _adv_payload(BLE_NAME)
         self._advertise()
+
         try:
             asyncio.create_task(self._housekeeping())
         except Exception as e:
@@ -137,11 +135,38 @@ class BleTeleop:
             print("BLE advertising as:", BLE_NAME)
         except Exception as e:
             print("BLE advertise failed:", e)
-        if self.oled:
-            try:
-                self.oled.show_lines("ZebraBot", "Advertising")
-            except Exception:
-                pass
+
+        # Do not overwrite the OLED here.
+        # The user program or main runtime should own the display.
+
+    def _cancel_oled_msg(self):
+        try:
+            if self._oled_msg_task is not None:
+                self._oled_msg_task.cancel()
+        except Exception:
+            pass
+        self._oled_msg_task = None
+
+    def _oled_temp_message(self, *lines, hold_ms=800, clear_after=True):
+        if not self.oled:
+            return
+        self._cancel_oled_msg()
+        try:
+            self._oled_msg_task = asyncio.create_task(
+                self._oled_temp_message_task(lines, hold_ms, clear_after)
+            )
+        except Exception as e:
+            self.notify_error("OLED_TEMP", e)
+
+    async def _oled_temp_message_task(self, lines, hold_ms, clear_after):
+        try:
+            if self.oled:
+                self.oled.show_lines(*lines)
+                await asyncio.sleep_ms(int(hold_ms))
+                if clear_after:
+                    self.oled.clear()
+        except Exception as e:
+            self.notify_error("OLED_TEMP_TASK", e)
 
     async def _housekeeping(self):
         while True:
@@ -149,11 +174,13 @@ class BleTeleop:
                 if self._connected_flag:
                     self._connected_flag = False
                     self._on_connected()
+
                 if self._disconnected_flag:
                     self._disconnected_flag = False
                     self._on_disconnected()
             except Exception as e:
                 self.notify_error("HOUSEKEEP", e)
+
             await asyncio.sleep_ms(50)
 
     def _on_connected(self):
@@ -167,13 +194,27 @@ class BleTeleop:
 
         if self.oled:
             try:
+                # Keep the visual feedback brief, then release the display.
                 self.oled.flash_connected()
+                try:
+                    asyncio.create_task(self._clear_oled_after_connect())
+                except Exception as e:
+                    self.notify_error("OLED_CLEAR_SCHED", e)
             except Exception as e:
                 self.notify_error("OLED_FLASH", e)
 
         self._emit_motor_config()
         if self._motor_fb_enabled:
             self._emit_motor_snapshot()
+
+    async def _clear_oled_after_connect(self):
+        try:
+            # flash_connected() takes about 800 ms, then writes "BLE Connected"
+            await asyncio.sleep_ms(1800)
+            if self.oled:
+                self.oled.clear()
+        except Exception as e:
+            self.notify_error("OLED_CLEAR", e)
 
     def _on_disconnected(self):
         print("BLE disconnected -> stopping robot")
@@ -190,10 +231,8 @@ class BleTeleop:
             self.notify_error("STEER_CENTER", e)
 
         if self.oled:
-            try:
-                self.oled.show_lines("ZebraBot", "Disconnected")
-            except Exception as e:
-                self.notify_error("OLED_DISCONNECT", e)
+            # Brief disconnect notice only, do not permanently own the display.
+            self._oled_temp_message("ZebraBot", "Disconnected", hold_ms=700, clear_after=True)
 
         self._advertise()
 
@@ -211,12 +250,15 @@ class BleTeleop:
                 conn_handle, value_handle = data
                 if value_handle != self._rx_handle:
                     return
+
                 raw = self._ble.gatts_read(self._rx_handle)
                 if not raw:
                     return
+
                 self._rx_buf += raw
                 if len(self._rx_buf) > self._max_rx:
-                    self._rx_buf = self._rx_buf[-self._max_rx :]
+                    self._rx_buf = self._rx_buf[-self._max_rx:]
+
                 self._drain_rx_lines()
 
         except Exception as e:
@@ -261,13 +303,16 @@ class BleTeleop:
             if not self.motor_port_map:
                 self._notify("ERR MTR_CFG unavailable")
                 return
+
             for port in sorted(self.motor_port_map.keys()):
                 cfg = self.motor_port_map[port]
                 name = cfg.get("name", "M{}".format(port))
                 pwm = cfg.get("pwm", -1)
                 direc = cfg.get("dir", -1)
                 enc = cfg.get("enc", -1)
-                self._notify("MTR_CFG {} {} PWM={} DIR={} ENC={}".format(port, name, pwm, direc, enc))
+                self._notify(
+                    "MTR_CFG {} {} PWM={} DIR={} ENC={}".format(port, name, pwm, direc, enc)
+                )
         except Exception as e:
             self.notify_error("MTR_CFG", e)
 
@@ -314,6 +359,7 @@ class BleTeleop:
                 os.remove(self._upload_tmp)
             except OSError:
                 pass
+
             self._upload_fp = open(self._upload_tmp, "wb")
             self._notify("PUT_OK BEGIN")
         except Exception as e:
@@ -325,6 +371,7 @@ class BleTeleop:
         if self._upload_fp is None:
             self._notify("PUT_ERR no active upload")
             return
+
         try:
             data = ubinascii.a2b_base64(data_b64)
             self._upload_fp.write(data)
@@ -338,20 +385,25 @@ class BleTeleop:
         if self._upload_fp is None or self._upload_path is None or self._upload_tmp is None:
             self._notify("PUT_ERR no active upload")
             return
+
         try:
             self._upload_fp.close()
             self._upload_fp = None
+
             try:
                 os.remove(self._upload_path)
             except OSError:
                 pass
+
             os.rename(self._upload_tmp, self._upload_path)
             self._notify("PUT_OK END")
             self.notify_info("Uploaded {}".format(self._upload_path))
+
         except Exception as e:
             self.notify_error("PUT_END", e)
             self._notify("PUT_ERR end")
             self._abort_upload(silent=True)
+
         finally:
             self._upload_path = None
             self._upload_tmp = None
@@ -363,15 +415,18 @@ class BleTeleop:
                     self._upload_fp.close()
                 except Exception:
                     pass
+
             if self._upload_tmp:
                 try:
                     os.remove(self._upload_tmp)
                 except OSError:
                     pass
+
         finally:
             self._upload_fp = None
             self._upload_path = None
             self._upload_tmp = None
+
         if not silent:
             self._notify("PUT_OK ABORT")
 
@@ -454,11 +509,11 @@ class BleTeleop:
                 return
 
             if line.startswith("PUT_BEGIN "):
-                self._begin_upload(line[len("PUT_BEGIN ") :].strip())
+                self._begin_upload(line[len("PUT_BEGIN "):].strip())
                 return
 
             if line.startswith("PUT_CHUNK "):
-                self._chunk_upload(line[len("PUT_CHUNK ") :].strip())
+                self._chunk_upload(line[len("PUT_CHUNK "):].strip())
                 return
 
             if line == "PUT_END":

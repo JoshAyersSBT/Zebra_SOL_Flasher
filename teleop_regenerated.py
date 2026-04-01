@@ -33,10 +33,41 @@ from PyQt6.QtBluetooth import (
 )
 
 import os
+import sys
+
 
 def app_root_dir() -> Path:
     return Path(__file__).resolve().parent
 
+
+def ensure_robot_package_importable() -> None:
+    """
+    Make desktop teleop imports behave like the runtime layout where a
+    robot/ directory lives beside main.py.
+
+    This allows imports such as:
+        from robot.oled_status import OledStatus
+    even when the app is launched from an unexpected working directory.
+    """
+    base = app_root_dir()
+    base_str = str(base)
+    if base_str not in sys.path:
+        sys.path.insert(0, base_str)
+
+    robot_dir = base / "robot"
+    if robot_dir.is_dir():
+        init_py = robot_dir / "__init__.py"
+        if not init_py.exists():
+            try:
+                init_py.write_text(
+                    '# Auto-created so desktop tools can import the robot package.\n',
+                    encoding='utf-8',
+                )
+            except Exception:
+                pass
+
+
+ensure_robot_package_importable()
 
 def projects_root_dir() -> Path:
     return app_root_dir() / "projects"
@@ -90,6 +121,12 @@ def build_staged_runtime_project(source_root: str | Path):
 
     shutil.copy2(runtime_main, stage / "main.py")
     shutil.copytree(runtime_robot, stage / "robot", dirs_exist_ok=True)
+    staged_robot_init = stage / "robot" / "__init__.py"
+    if not staged_robot_init.exists():
+        staged_robot_init.write_text(
+            "# Auto-created so desktop tools and staged deploys can import robot.*\n",
+            encoding="utf-8",
+        )
     shutil.copy2(student_entry, stage / "user_main.py")
 
     skip_dir_names = {
@@ -2648,6 +2685,10 @@ class ProjectEditorTab(QWidget):
             return
 
         project_dir.mkdir(parents=True, exist_ok=True)
+        (project_dir / "robot").mkdir(parents=True, exist_ok=True)
+        init_py = project_dir / "robot" / "__init__.py"
+        if not init_py.exists():
+            init_py.write_text("# Local robot helpers for desktop authoring.\n", encoding="utf-8")
 
         (project_dir / "main.py").write_text(
             "from main import zbot\n"
@@ -3312,6 +3353,11 @@ class MainWindow(QWidget):
 
 
 def main():
+    try:
+        os.chdir(app_root_dir())
+    except Exception:
+        pass
+
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     w = MainWindow()

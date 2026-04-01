@@ -1,4 +1,3 @@
-# main.py
 import time
 import uasyncio as asyncio
 from machine import I2C, Pin
@@ -40,13 +39,13 @@ from robot.debug_io import (
 SAFE_MODE_PIN = 0
 BOOT_GRACE_SECONDS = 3
 
+API = None
+zbot = None
+
 
 class RobotAPI:
     """
-    Shared runtime API exposed to user programs.
-
-    This keeps main.py focused on system bring-up while giving user_main.py
-    a stable way to read live state and command actuators.
+    Shared runtime API exposed to user programs and internal services.
     """
 
     def __init__(self):
@@ -239,11 +238,249 @@ class RobotAPI:
             return False
 
 
-API = None
+class _ZBotSensor:
+    """
+    Simple student-facing sensor wrapper.
 
+    Currently focused on ToF distance style access from the shared sensor snapshot.
+    """
 
+    def __init__(self, api, port):
+        self.api = api
+        self.port = int(port)
+
+    def _find_snapshot_value(self):
+        sensors = self.api.get_sensor_snapshot()
+
+        # Preferred simple key
+        key = "tof_port_{}".format(self.port)
+        item = sensors.get(key)
+        if isinstance(item, dict):
+            value = item.get("value")
+            if isinstance(value, (int, float)):
+                return int(value)
+
+        # Fallbacks for slightly different snapshot naming
+        fallback_keys = (
+            "port{}_tof".format(self.port),
+            "tof_{}".format(self.port),
+            "sensor_port_{}".format(self.port),
+        )
+
+        for key in fallback_keys:
+            item = sensors.get(key)
+            if isinstance(item, dict):
+                value = item.get("value")
+                if isinstance(value, (int, float)):
+                    return int(value)
+
+        # Generic fallback using meta
+        for key, item in sensors.items():
+            if not isinstance(item, dict):
+                continue
+
+            value = item.get("value")
+            if not isinstance(value, (int, float)):
+                continue
+
+            meta = item.get("meta", {})
+            key_s = str(key).lower()
+            meta_s = str(meta).lower()
+
+            if "tof" in key_s and str(self.port) in key_s:
+                return int(value)
+
+            if "tof" in meta_s and str(self.port) in meta_s:
+                return int(value)
+
+        return None
+
+    def read(self):
+        return self._find_snapshot_value()
+class _ZBotMotor:
+    """
+    Simple student-facing motor wrapper.
+
+    Intended usage:
+        m = zbot.motors(1, "DC")
+        m.on(60)
+        m.off()
+    """
+
+    def __init__(self, api, port, motor_type="DC"):
+        self.api = api
+        self.port = int(port)
+        self.motor_type = str(motor_type)
+        self._publish_meta()
+
+    def _publish_meta(self):
+        if self.api is None:
+            return
+        try:
+            if "student_motors" not in self.api.status:
+                self.api.status["student_motors"] = {}
+            self.api.status["student_motors"][self.port] = {
+                "type": self.motor_type,
+                "ts_ms": time.ticks_ms(),
+            }
+        except Exception:
+            pass
+
+    def on(self, power=50):
+        if self.api is None:
+            return False
+        self._publish_meta()
+        self.api.set_motor(self.port, int(power))
+        return True
+
+    def off(self):
+        if self.api is None:
+            return False
+        self.api.stop_motor(self.port)
+        return True
+
+    def stop(self):
+        return self.off()
+
+    def speed(self, power):
+        return self.on(power)
+
+    def set(self, power):
+        return self.on(power)
+
+    def value(self):
+        if self.api is None:
+            return None
+        try:
+            return self.api.get_motor_status().get(self.port, {})
+        except Exception:
+            return None
+
+class ZBot:
+    """
+    Small teaching API layered on top of the full robot runtime.
+
+    Intended student usage:
+        from main import zbot
+
+        tof = zbot.sensor(1)
+        d = tof.read()
+
+        motor = zbot.motors(1, "DC")
+        motor.on(60)
+        motor.off()
+
+        zbot.forward(60)
+        zbot.stop()
+        zbot.display("HELLO")
+    """
+
+    def __init__(self, api=None):
+        self.api = api
+        self._motor_wrappers = {}
+
+    def bind(self, api):
+        self.api = api
+        return self
+
+    def ready(self):
+        return self.api is not None and bool(self.api.status["system"].get("ready", False))
+
+    # -------------------------
+    # movement
+    # -------------------------
+    def forward(self, power=50):
+        if self.api is None:
+            return False
+        self.api.drive_tank(int(power), int(power))
+        return True
+
+    def backward(self, power=50):
+        if self.api is None:
+            return False
+        p = int(power)
+        self.api.drive_tank(-p, -p)
+        return True
+
+    def tank(self, left_power, right_power):
+        if self.api is None:
+            return False
+        self.api.drive_tank(int(left_power), int(right_power))
+        return True
+
+    def stop(self):
+        if self.api is None:
+            return False
+        self.api.stop_all()
+        return True
+
+    # -------------------------
+    # individual motors
+    # -------------------------
+    def motors(self, port, motor_type="DC"):
+        key = (int(port), str(motor_type))
+        if self.api is None:
+            return _ZBotMotor(None, port, motor_type)
+
+        if key not in self._motor_wrappers:
+            self._motor_wrappers[key] = _ZBotMotor(self.api, port, motor_type)
+
+        return self._motor_wrappers[key]
+
+    def motor(self, port, motor_type="DC"):
+        return self.motors(port, motor_type)
+
+    # -------------------------
+    # display
+    # -------------------------
+    def display(self, line1="", line2=""):
+        if self.api is None:
+            return False
+        return self.api.show_lines(str(line1), str(line2))
+
+    def say(self, line1="", line2=""):
+        return self.display(line1, line2)
+
+    # -------------------------
+    # sensors
+    # -------------------------
+    def sensor(self, port):
+        if self.api is None:
+            return _ZBotSensor(None, port)
+        return _ZBotSensor(self.api, port)
+
+    def tof(self, port):
+        s = self.sensor(port)
+        return s.read()
+
+    # -------------------------
+    # utilities
+    # -------------------------
+    def status(self):
+        if self.api is None:
+            return {}
+        return self.api.get_status()
+
+    def sensors(self):
+        if self.api is None:
+            return {}
+        return self.api.get_sensor_snapshot()
+
+    def motor_status(self):
+        if self.api is None:
+            return {}
+        return self.api.get_motor_status()
+
+    def motor_feedback(self):
+        if self.api is None:
+            return {}
+        return self.api.get_motor_feedback()
 def get_api():
     return API
+
+
+def get_zbot():
+    return zbot
 
 
 async def _api_housekeeping_task(api):
@@ -287,17 +524,20 @@ async def _run_user_program(api):
     api.status["user"]["last_error"] = None
 
     try:
-        # Prefer API-first user programs, but keep backward compatibility.
         argc = None
         try:
             argc = user_fn.__code__.co_argcount
         except Exception:
             pass
 
-        if argc == 1:
-            await user_fn(api)
+        # Support both:
+        #   async def main():
+        #   async def main(api):
+        if argc == 0:
+            await user_fn()
         else:
             await user_fn(api)
+
     except Exception as e:
         api.status["user"]["last_error"] = repr(e)
         error("USER_MAIN", e)
@@ -307,6 +547,7 @@ async def _run_user_program(api):
 
 async def main():
     global API
+    global zbot
 
     teleop = None
     sensor_hub = None
@@ -323,6 +564,9 @@ async def main():
 
     api = RobotAPI()
     API = api
+
+    # bind student-facing wrapper immediately
+    zbot = ZBot(api)
 
     info("BOOT: starting robot init")
     state("BOOT", "start")
