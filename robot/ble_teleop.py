@@ -203,7 +203,11 @@ class BleTeleop:
                     continue
 
                 await asyncio.sleep_ms(12)
-            except Exception:
+            except Exception as e:
+                try:
+                    print("BLE TX task error:", repr(e))
+                except Exception:
+                    pass
                 await asyncio.sleep_ms(50)
 
     def _queue_notify(self, text: str):
@@ -227,15 +231,22 @@ class BleTeleop:
     def _serial_exception(self, tag: str, exc):
         try:
             self._serial_write("ERR " + str(tag))
-            sys.print_exception(exc)
-        except Exception:
+            if isinstance(exc, BaseException):
+                sys.print_exception(exc)
+            else:
+                self._serial_write(repr(exc))
+        except Exception as inner_exc:
             try:
                 self._serial_write("ERR {} {}".format(tag, repr(exc)))
+                self._serial_write("ERR SERIAL_EXC {}".format(repr(inner_exc)))
             except Exception:
                 pass
 
     def _broadcast_line(self, text: str):
-        text = str(text)
+        try:
+            text = str(text)
+        except Exception:
+            text = "<broadcast stringify error>"
         self._serial_write(text)
         self._notify(text)
 
@@ -334,7 +345,6 @@ class BleTeleop:
                 self.notify_error("RX_CMD", e)
 
     def _notify(self, text: str):
-        # TX characteristic only; never write to RX.
         if self._conn_handle is None:
             return
         self._queue_notify(text)
@@ -347,13 +357,19 @@ class BleTeleop:
             self._broadcast_line("INFO " + line)
 
     def notify_error(self, tag: str, exc):
-        # Always print the full traceback to USB/serial first.
+        # Always print the full detail to USB/serial first.
         self._serial_exception(tag, exc)
 
-        # Then try a BLE-friendly summarized version.
+        # Then try BLE-friendly summarized output.
         try:
             self._notify("ERR " + str(tag))
-            for line in split_lines(exc_to_string(exc), max_len=120):
+
+            if isinstance(exc, BaseException):
+                msg = exc_to_string(exc)
+            else:
+                msg = repr(exc)
+
+            for line in split_lines(str(msg), max_len=120):
                 self._notify("ERR " + line)
         except Exception:
             pass

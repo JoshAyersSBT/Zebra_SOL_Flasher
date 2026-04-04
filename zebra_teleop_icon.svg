@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="110" fill="#ffffff"/>
+  <rect x="16" y="16" width="480" height="480" rx="94" fill="none" stroke="#111111" stroke-width="18"/>
+
+  <!-- ears -->
+  <path d="M150 118 L105 62 L186 94 Z" fill="#111111"/>
+  <path d="M362 118 L407 62 L326 94 Z" fill="#111111"/>
+
+  <!-- mane -->
+  <path d="M256 74
+           C226 96 206 124 200 158
+           C194 194 202 236 221 274
+           L291 274
+           C310 236 318 194 312 158
+           C306 124 286 96 256 74 Z" fill="#111111"/>
+
+  <!-- face -->
+  <path d="M256 116
+           C174 116 122 186 135 271
+           C145 336 195 395 256 421
+           C317 395 367 336 377 271
+           C390 186 338 116 256 116 Z"
+        fill="#ffffff" stroke="#111111" stroke-width="16" stroke-linejoin="round"/>
+
+  <!-- stripes left -->
+  <path d="M195 156 C180 184 175 211 180 242" stroke="#111111" stroke-width="18" stroke-linecap="round" fill="none"/>
+  <path d="M165 192 C154 217 151 241 156 269" stroke="#111111" stroke-width="16" stroke-linecap="round" fill="none"/>
+  <path d="M155 246 C152 274 157 300 170 325" stroke="#111111" stroke-width="14" stroke-linecap="round" fill="none"/>
+
+  <!-- stripes right -->
+  <path d="M317 156 C332 184 337 211 332 242" stroke="#111111" stroke-width="18" stroke-linecap="round" fill="none"/>
+  <path d="M347 192 C358 217 361 241 356 269" stroke="#111111" stroke-width="16" stroke-linecap="round" fill="none"/>
+  <path d="M357 246 C360 274 355 300 342 325" stroke="#111111" stroke-width="14" stroke-linecap="round" fill="none"/>
+
+  <!-- eyes -->
+  <ellipse cx="216" cy="234" rx="14" ry="18" fill="#111111"/>
+  <ellipse cx="296" cy="234" rx="14" ry="18" fill="#111111"/>
+
+  <!-- muzzle -->
+  <path d="M202 302
+           C208 351 229 384 256 398
+           C283 384 304 351 310 302
+           C294 288 274 280 256 280
+           C238 280 218 288 202 302 Z"
+        fill="#f4f4f4" stroke="#111111" stroke-width="12" stroke-linejoin="round"/>
+
+  <!-- nostrils -->
+  <ellipse cx="232" cy="330" rx="9" ry="14" fill="#111111"/>
+  <ellipse cx="280" cy="330" rx="9" ry="14" fill="#111111"/>
+
+  <!-- smile -->
+  <path d="M242 355 Q256 367 270 355" stroke="#111111" stroke-width="8" stroke-linecap="round" fill="none"/>
+</svg>

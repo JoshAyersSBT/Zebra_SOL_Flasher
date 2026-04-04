@@ -474,6 +474,96 @@ def _format_ble_line(api):
         return "BLE: ?"
 
 
+def _sensor_port_line(api, port):
+    sensors = api.status.get("sensors", {})
+
+    candidates = [
+        "tof_port_{}".format(port),
+        "port{}_tof".format(port),
+        "tof_{}".format(port),
+        "sensor_port_{}".format(port),
+        "color_port_{}".format(port),
+        "port{}_color".format(port),
+    ]
+
+    for key in candidates:
+        item = sensors.get(key)
+        if not isinstance(item, dict):
+            continue
+
+        value = item.get("value")
+        meta = item.get("meta", {})
+        key_l = key.lower()
+        meta_l = str(meta).lower()
+
+        if isinstance(value, (int, float)) and ("tof" in key_l or "tof" in meta_l):
+            return "P{} TOF {}mm".format(port, int(value))
+
+        if isinstance(value, dict):
+            if "r" in value and "g" in value and "b" in value:
+                return "P{} RGB".format(port)
+
+        if isinstance(value, (int, float)):
+            return "P{} {}".format(port, int(value))
+
+        if value is not None:
+            return "P{} {}".format(port, str(value)[:10])
+
+    # broader fallback search
+    for key, item in sensors.items():
+        if not isinstance(item, dict):
+            continue
+        key_l = str(key).lower()
+        meta_l = str(item.get("meta", {})).lower()
+        if str(port) not in key_l and str(port) not in meta_l:
+            continue
+
+        value = item.get("value")
+        if isinstance(value, (int, float)) and ("tof" in key_l or "tof" in meta_l):
+            return "P{} TOF {}mm".format(port, int(value))
+        if value is not None:
+            return "P{} {}".format(port, str(value)[:10])
+
+    mode = None
+    try:
+        mode = SENSOR_PORT_MODES.get(port)
+    except Exception:
+        mode = None
+
+    if mode:
+        return "P{} {}".format(port, str(mode))
+    return "P{} empty".format(port)
+
+
+def _sensor_overview_pages(api):
+    pages = []
+
+    user = api.status.get("user", {})
+    if user.get("last_error"):
+        err_name = str(user.get("last_error"))[:18]
+        pages.append(("ZebraBot", "User Error", err_name))
+    else:
+        pages.append(("ZebraBot", "No user code", "Sensor monitor"))
+
+    ports = [1, 2, 3, 4, 5, 6]
+    for i in range(0, len(ports), 3):
+        chunk = ports[i:i + 3]
+        lines = ["Sensors"]
+        for port in chunk:
+            lines.append(_sensor_port_line(api, port))
+        pages.append(tuple(lines))
+
+    imu = api.status.get("imu", {})
+    if imu:
+        if "error" in imu:
+            pages.append(("IMU", "error", str(imu.get("error"))[:18]))
+        else:
+            value = imu.get("value")
+            pages.append(("IMU", str(value)[:20], ""))
+
+    return pages
+
+
 async def _api_housekeeping_task(api):
     while True:
         try:
@@ -500,6 +590,9 @@ async def _api_housekeeping_task(api):
 
 async def _oled_status_task(api):
     last_lines = None
+    page_idx = 0
+    last_page_ms = 0
+    page_period_ms = 1400
 
     while True:
         try:
@@ -512,12 +605,31 @@ async def _oled_status_task(api):
                 await asyncio.sleep_ms(200)
                 continue
 
-            line1 = "ZebraBot Ready" if api.status["system"].get("ready") else "ZebraBot Boot"
-            line2 = _format_ble_line(api)
-            line3 = _format_user_line(api)
-            line4 = _format_tof_line(api)
+            user = api.status.get("user", {})
+            fallback_mode = (not user.get("running")) or bool(user.get("last_error"))
 
-            lines = (line1, line2, line3, line4)
+            if fallback_mode:
+                pages = _sensor_overview_pages(api)
+                now = time.ticks_ms()
+                if not pages:
+                    lines = ("ZebraBot", "No sensors", "")
+                else:
+                    if (
+                        last_page_ms == 0
+                        or time.ticks_diff(now, last_page_ms) >= page_period_ms
+                    ):
+                        page_idx = (page_idx + 1) % len(pages)
+                        last_page_ms = now
+                    lines = pages[page_idx]
+            else:
+                line1 = "ZebraBot Ready" if api.status["system"].get("ready") else "ZebraBot Boot"
+                line2 = _format_ble_line(api)
+                line3 = _format_user_line(api)
+                line4 = _format_tof_line(api)
+                lines = (line1, line2, line3, line4)
+                page_idx = 0
+                last_page_ms = 0
+
             if lines != last_lines:
                 oled.show_lines(*lines)
                 last_lines = lines
@@ -525,7 +637,7 @@ async def _oled_status_task(api):
         except Exception as e:
             error("OLED_STATUS_TASK", e)
 
-        await asyncio.sleep_ms(300)
+        await asyncio.sleep_ms(250)
 
 
 async def _boot_complete_message(api):
@@ -534,45 +646,37 @@ async def _boot_complete_message(api):
 
 
 async def _run_user_program(api):
-    teleop = api.get_handle("teleop")
-
     try:
         import user_main
     except Exception as e:
         error("USER_IMPORT", e)
         api.status["user"]["last_error"] = repr(e)
 
+        teleop = api.get_handle("teleop")
         if teleop is not None:
             try:
                 teleop.notify_error("USER_IMPORT", e)
             except Exception:
                 pass
-
-        try:
-            api.show_lines("User Import Err", "See BLE log")
-        except Exception:
-            pass
         return
 
     user_fn = getattr(user_main, "main", None)
     if user_fn is None:
         warn("USER: user_main.main missing")
+        api.status["user"]["last_error"] = "user_main.main missing"
 
+        teleop = api.get_handle("teleop")
         if teleop is not None:
             try:
                 teleop.notify_line("ERR USER main() missing")
             except Exception:
                 pass
-
-        try:
-            api.show_lines("User Error", "main() missing")
-        except Exception:
-            pass
         return
 
     api.status["user"]["running"] = True
     api.status["user"]["last_error"] = None
 
+    teleop = api.get_handle("teleop")
     if teleop is not None:
         try:
             teleop.notify_line("INFO USER main starting")
@@ -601,11 +705,6 @@ async def _run_user_program(api):
             except Exception:
                 pass
 
-        try:
-            api.show_lines("User Error", "See BLE log", str(type(e).__name__))
-        except Exception:
-            pass
-
     finally:
         api.status["user"]["running"] = False
 
@@ -614,6 +713,7 @@ async def _run_user_program(api):
                 teleop.notify_line("INFO USER main stopped")
             except Exception:
                 pass
+
 
 async def main():
     global API
