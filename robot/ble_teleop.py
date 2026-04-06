@@ -118,10 +118,22 @@ class BleTeleop:
 
         self._oled_msg_task = None
 
-        # outbound BLE notification queue
         self._tx_queue = []
         self._tx_queue_max = 80
         self._tx_drop_count = 0
+
+        # Important for file upload:
+        # allow longer BLE writes to accumulate instead of truncating.
+        try:
+            self._ble.gatts_set_buffer(self._rx_handle, self._max_rx, True)
+        except Exception as e:
+            print("BLE RX buffer setup failed:", e)
+
+        # Optional: seed TX handle with a small buffer too.
+        try:
+            self._ble.gatts_set_buffer(self._tx_handle, 512, False)
+        except Exception:
+            pass
 
         self.steering.angle(SERVO_CENTER_DEG)
 
@@ -137,6 +149,7 @@ class BleTeleop:
     def _advertise(self):
         self._conn_handle = None
         try:
+            # MicroPython commonly expects advertising interval in microseconds.
             self._ble.gap_advertise(100_000, adv_data=self._adv_data)
             print("BLE advertising as:", BLE_NAME)
         except Exception as e:
@@ -303,6 +316,7 @@ class BleTeleop:
             self._oled_temp_message("ZebraBot", "Disconnected", hold_ms=700, clear_after=True)
 
         self._tx_queue = []
+        self._rx_buf = b""
         self._advertise()
 
     def _irq(self, event, data):
@@ -357,10 +371,8 @@ class BleTeleop:
             self._broadcast_line("INFO " + line)
 
     def notify_error(self, tag: str, exc):
-        # Always print the full detail to USB/serial first.
         self._serial_exception(tag, exc)
 
-        # Then try BLE-friendly summarized output.
         try:
             self._notify("ERR " + str(tag))
 

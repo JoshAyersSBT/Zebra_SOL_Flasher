@@ -369,7 +369,66 @@ class GuiBleCodeUploader:
 
         self.client = BleakClient(self.address)
         await self.client.connect()
-        await self.client.start_notify(NUS_TX_UUID, self._on_notify)
+
+        try:
+            services = await self.client.get_services()
+        except Exception as e:
+            try:
+                await self.client.disconnect()
+            except Exception:
+                pass
+            raise RuntimeError(f"Connected to {self.address}, but failed to enumerate BLE services: {e}") from e
+
+        found_service = False
+        found_tx = False
+        found_rx = False
+        service_uuids = []
+        char_uuids = []
+
+        try:
+            for svc in services:
+                su = str(getattr(svc, 'uuid', '') or '').upper()
+                if su:
+                    service_uuids.append(su)
+                if su == NUS_SERVICE_UUID.upper():
+                    found_service = True
+                for ch in getattr(svc, 'characteristics', []) or []:
+                    cu = str(getattr(ch, 'uuid', '') or '').upper()
+                    if cu:
+                        char_uuids.append(cu)
+                    if cu == NUS_TX_UUID.upper():
+                        found_tx = True
+                    if cu == NUS_RX_UUID.upper():
+                        found_rx = True
+        except Exception:
+            pass
+
+        if not (found_service and found_tx and found_rx):
+            try:
+                await self.client.disconnect()
+            except Exception:
+                pass
+
+            seen_services = ", ".join(sorted(dict.fromkeys(service_uuids))) or "none"
+            seen_chars = ", ".join(sorted(dict.fromkeys(char_uuids))) or "none"
+            raise RuntimeError(
+                "Connected to BLE device, but the ZebraBot NUS upload service was not found. "
+                f"Expected service {NUS_SERVICE_UUID} with TX {NUS_TX_UUID} and RX {NUS_RX_UUID}. "
+                f"Found services: {seen_services}. Found characteristics: {seen_chars}. "
+                "This usually means the robot is still running the older BLE firmware/service instead of robot/ble_teleop.py."
+            )
+
+        try:
+            await self.client.start_notify(NUS_TX_UUID, self._on_notify)
+        except Exception as e:
+            try:
+                await self.client.disconnect()
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"Connected to {self.address}, but failed to enable NUS TX notifications on {NUS_TX_UUID}: {e}"
+            ) from e
+
         self._log(f"Connected to {self.address}")
         return self
 
