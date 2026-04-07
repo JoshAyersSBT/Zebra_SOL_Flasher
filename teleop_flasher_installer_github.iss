@@ -38,6 +38,7 @@ UsePreviousAppDir=yes
 SetupLogging=yes
 CreateUninstallRegKey=yes
 UninstallDisplayName={#AppName}
+SetupIconFile=icon.ico
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -55,10 +56,11 @@ Name: "{localappdata}\ZebraTeleopFlasher\logs"
 Name: "{localappdata}\ZebraTeleopFlasher\projects"
 
 [Files]
-
+Source: "icon.ico"; DestDir: "{app}"; Flags: ignoreversion
 [Icons]
-Name: "{autoprograms}\{#AppName}"; Filename: "{app}\launch_teleop.bat"; WorkingDir: "{app}"
-Name: "{autodesktop}\{#AppName}"; Filename: "{app}\launch_teleop.bat"; WorkingDir: "{app}"; Tasks: desktopicon
+Name: "{autoprograms}\{#AppName}"; Filename: "{app}\launch_teleop.bat"; WorkingDir: "{app}"; IconFilename: "{app}\icon.ico"
+
+Name: "{autodesktop}\{#AppName}"; Filename: "{app}\launch_teleop.bat"; WorkingDir: "{app}"; IconFilename: "{app}\icon.ico"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\launch_teleop.bat"; WorkingDir: "{app}"; Description: "Launch {#AppName}"; Flags: nowait postinstall skipifsilent
