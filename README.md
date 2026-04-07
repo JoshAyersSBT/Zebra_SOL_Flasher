@@ -129,22 +129,71 @@ Edit config.json to customize:
 
 ## 🛠️ Flashing Workflow
 
+The Teleop Flasher application uses a guided workflow so the user can choose how they want to connect, flash, and deploy the robot project.
+
+### 1. Choose a Flash / Deploy Method
+From the Teleop window, the user selects the workflow they want to use:
+- **Serial / USB**
+- **BLE**
+- **Firmware Flash**
+- **Project Deploy**
+
+This keeps firmware flashing separate from project deployment and avoids accidentally reflashing when the user only wants to update code.
+
+### 2. Scan for Available Devices
+Depending on the selected workflow, the Teleop app scans for:
+- **Serial ports** for USB flashing and deployment
+- **BLE devices** for wireless connection and upload
+
+The user then selects the target device from the discovered list before continuing.
+
+### 3. Configure the Action
+After selecting the device, the app allows the user to confirm the action:
+- **Flash firmware** to the ESP32
+- **Deploy project files** to the robot
+- **Connect for telemetry / control**
+
+This matches the Teleop program behavior where the connection step happens first and the action is chosen explicitly.
+
+### 4. Run the Job With Live Status Output
+The Teleop app shows progress and logs while the action is running so the user can see:
+- active port or BLE target
+- current file being uploaded
+- flash progress
+- errors and tracebacks
+- completion state
+
+### 5. Verify Connection and Telemetry
+After flashing or deploying, the app can connect to the robot and show:
+- BLE connection state
+- detected sensors
+- telemetry updates
+- error output if user code fails
+
 ### Firmware Flash
-1. Select COM port
-2. Flash firmware
-3. Wait for completion
+Typical serial firmware flashing in the Teleop workflow uses `esptool`:
 
-### Code Deployment
-
-Serial:
 ```
+python -m esptool --chip esp32 --port COMX erase_flash
+python -m esptool --chip esp32 --port COMX --baud 460800 write_flash -z 0x1000 firmware.bin
+```
+
+### Project Deployment
+
+#### Serial Deploy
+Typical serial project deployment uses `mpremote` to copy the robot project to the device:
+
+```
+mpremote connect COMX fs mkdir :/robot
 mpremote connect COMX fs cp -r robot/ :
 ```
 
-BLE:
-- Scan devices
-- Select robot
-- Upload wirelessly
+#### BLE Deploy
+In BLE mode, the Teleop program:
+- scans for nearby robot devices
+- connects to the selected robot
+- uploads project files wirelessly
+- reports progress file-by-file
 
 ---
 
