@@ -146,6 +146,40 @@ class BleTeleop:
         except Exception as e:
             print("BLE task start failed:", e)
 
+    async def imu_task(self):
+        """
+        Periodically read the MPU6050 and publish IMU packets over both
+        serial and BLE using the existing notifier path.
+
+        Packet format matches what the desktop teleop parser expects:
+            IMU ax ay az gx gy gz temp
+        """
+        if self.imu is None:
+            self.notify_info("IMU task disabled: no IMU configured")
+            return
+
+        self.notify_info("IMU task started")
+
+        while True:
+            try:
+                if self._imu_enabled:
+                    d = self.imu.read_scaled()
+                    self.notify_line(
+                        "IMU {:.3f} {:.3f} {:.3f} {:.3f} {:.3f} {:.3f} {:.2f}".format(
+                            d["ax_g"],
+                            d["ay_g"],
+                            d["az_g"],
+                            d["gx_dps"],
+                            d["gy_dps"],
+                            d["gz_dps"],
+                            d["temp_c"],
+                        )
+                    )
+            except Exception as e:
+                self.notify_error("IMU_TASK", e)
+
+            await asyncio.sleep_ms(self.imu_period_ms)
+
     def _advertise(self):
         self._conn_handle = None
         try:

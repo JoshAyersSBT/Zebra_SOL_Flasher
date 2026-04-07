@@ -92,76 +92,181 @@ def is_editor_project_root(path: str | Path) -> bool:
         return False
 
 
-def build_staged_runtime_project(source_root: str | Path):
+def _copy_python_tree(src_root: Path, dst_root: Path, *, rename_main_to: str | None = None):
     """
-    If source_root is one of the editor projects, build a staged deploy tree:
+    Copy only deploy-relevant Python files into a staged tree.
 
-        staged/
-            main.py       <- runtime main.py
-            user_main.py  <- student project main.py (or user_main.py)
-            robot/        <- runtime robot package
-            ...extra student files...
-
-    Otherwise return the original folder unchanged.
+    Rules:
+    - Only .py and .mpy files are copied.
+    - Hidden folders, cache folders, venvs, build outputs, and node_modules are skipped.
+    - If rename_main_to is provided, src_root/main.py is copied to that filename in dst_root.
     """
-    src = Path(source_root).resolve()
-
-    if not is_editor_project_root(src):
-        return None, src
-
-    runtime_root = app_root_dir()
-    runtime_main = runtime_root / "main.py"
-    runtime_robot = runtime_root / "robot"
-
-    if not runtime_main.is_file():
-        raise RuntimeError(f"Runtime main.py not found: {runtime_main}")
-
-    if not runtime_robot.is_dir():
-        raise RuntimeError(f"Runtime robot/ folder not found: {runtime_robot}")
-
-    if (src / "user_main.py").is_file():
-        student_entry = src / "user_main.py"
-    elif (src / "main.py").is_file():
-        student_entry = src / "main.py"
-    else:
-        raise RuntimeError(f"Student project must contain main.py or user_main.py: {src}")
-
-    tmp = tempfile.TemporaryDirectory(prefix="zbot_stage_")
-    stage = Path(tmp.name)
-
-    shutil.copy2(runtime_main, stage / "main.py")
-    shutil.copytree(runtime_robot, stage / "robot", dirs_exist_ok=True)
-    staged_robot_init = stage / "robot" / "__init__.py"
-    if not staged_robot_init.exists():
-        staged_robot_init.write_text(
-            "# Auto-created so desktop tools and staged deploys can import robot.*\n",
-            encoding="utf-8",
-        )
-    shutil.copy2(student_entry, stage / "user_main.py")
-
     skip_dir_names = {
         "__pycache__", ".git", ".idea", ".vscode",
         ".mypy_cache", ".pytest_cache", "node_modules",
         ".venv", "venv", "dist", "build"
     }
-    skip_suffixes = {".pyc", ".pyo", ".tmp", ".swp", ".bak"}
+    allowed_suffixes = {".py", ".mpy"}
 
-    for path in sorted(src.rglob("*")):
+    src_root = Path(src_root).resolve()
+    dst_root = Path(dst_root).resolve()
+
+    for path in sorted(src_root.rglob("*")):
         if not path.is_file():
             continue
 
-        rel = path.relative_to(src)
+        rel = path.relative_to(src_root)
         rel_parts = rel.parts
-
         if any(part in skip_dir_names for part in rel_parts[:-1]):
             continue
-        if path.name.startswith(".") and path.name not in {".env"}:
+        if any(part.startswith('.') for part in rel_parts[:-1]):
             continue
-        if path.suffix.lower() in skip_suffixes:
+        if path.name.startswith('.'):
+            continue
+        if path.suffix.lower() not in allowed_suffixes:
+            continue
+        if should_skip_upload_file(path, rel.as_posix()):
             continue
 
+        dest_rel = rel
+        if rename_main_to and rel.as_posix() == 'main.py':
+            dest_rel = Path(rename_main_to)
+
+        dest = dst_root / dest_rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, dest)
+
+
+def build_staged_runtime_project(source_root: str | Path):
+    """
+    Build a clean deploy tree that contains only deploy-relevant Python files.
+
+    Editor project input:
+        staged/
+            main.py       <- runtime main.py from teleop app dir
+            user_main.py  <- selected project main.py or user_main.py
+            robot/        <- runtime robot package (.py/.mpy only)
+            ...extra project python files...
+
+    External runtime project input:
+        staged/
+            main.py       <- source project main.py
+            robot/        <- source project robot/ (.py/.mpy only)
+            ...extra python files from source root except teleop launcher files...
+
+    Returns:
+        (TemporaryDirectory | None, Path)
+    """
+    src = Path(source_root).resolve()
+    if not src.exists() or not src.is_dir():
+        raise RuntimeError(f"Project root not found: {src}")
+
+    tmp = tempfile.TemporaryDirectory(prefix="zbot_stage_")
+    stage = Path(tmp.name)
+
+    if is_editor_project_root(src):
+        runtime_root = app_root_dir()
+        runtime_main = runtime_root / 'main.py'
+        runtime_robot = runtime_root / 'robot'
+
+        if not runtime_main.is_file():
+            raise RuntimeError(f"Runtime main.py not found: {runtime_main}")
+        if not runtime_robot.is_dir():
+            raise RuntimeError(f"Runtime robot/ folder not found: {runtime_robot}")
+
+        student_entry = src / 'user_main.py'
+        if not student_entry.is_file():
+            student_entry = src / 'main.py'
+        if not student_entry.is_file():
+            raise RuntimeError(f"Student project must contain main.py or user_main.py: {src}")
+
+        shutil.copy2(runtime_main, stage / 'main.py')
+        _copy_python_tree(runtime_robot, stage / 'robot')
+        staged_robot_init = stage / 'robot' / '__init__.py'
+        if not staged_robot_init.exists():
+            staged_robot_init.write_text(
+                '# Auto-created so desktop tools and staged deploys can import robot.*',
+                encoding='utf-8',
+            )
+        shutil.copy2(student_entry, stage / 'user_main.py')
+
+        # Copy additional student Python modules, but do not duplicate the entrypoint.
+        for path in sorted(src.rglob('*')):
+            if not path.is_file():
+                continue
+            rel = path.relative_to(src)
+            if any(part in {"__pycache__", ".git", ".idea", ".vscode", ".mypy_cache", ".pytest_cache", "node_modules", ".venv", "venv", "dist", "build"} for part in rel.parts[:-1]):
+                continue
+            if any(part.startswith('.') for part in rel.parts[:-1]):
+                continue
+            if path.name.startswith('.'):
+                continue
+            if path.suffix.lower() not in {'.py', '.mpy'}:
+                continue
+            if rel.as_posix() in {'main.py', 'user_main.py'}:
+                continue
+            dest = stage / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, dest)
+
+        return tmp, stage
+
+    # External runtime project: keep only runtime files that belong on-device.
+    # This intentionally excludes the desktop app's local projects/ library and
+    # unrelated helper scripts in the app root.
+    main_src = src / 'main.py'
+    robot_src = src / 'robot'
+    if not main_src.is_file():
+        raise RuntimeError(f"main.py not found: {main_src}")
+    if not robot_src.is_dir():
+        raise RuntimeError(f"robot folder not found: {robot_src}")
+
+    shutil.copy2(main_src, stage / 'main.py')
+    _copy_python_tree(robot_src, stage / 'robot')
+
+    user_main_src = src / 'user_main.py'
+    if user_main_src.is_file():
+        shutil.copy2(user_main_src, stage / 'user_main.py')
+    elif src == app_root_dir().resolve() and (src / 'projects').is_dir():
+        raise RuntimeError(
+            "Deploy source is the teleop application root. Select a specific student project folder from projects/ "
+            "or use the Project Editor's Configure + Deploy flow so the selected project's main.py can be staged as user_main.py."
+        )
+
+    # Copy only additional package/module folders that are explicitly part of the
+    # runtime project. Skip the editor's projects/ library entirely.
+    skip_top_level = {
+        'robot', 'projects', '__pycache__', '.git', '.idea', '.vscode',
+        '.mypy_cache', '.pytest_cache', 'node_modules', '.venv', 'venv',
+        'dist', 'build'
+    }
+    allowed_suffixes = {'.py', '.mpy'}
+
+    for path in sorted(src.rglob('*')):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(src)
         rel_posix = rel.as_posix()
-        if rel_posix in {"main.py", "user_main.py"}:
+        parts = rel.parts
+
+        if rel_posix in {'main.py', 'user_main.py'} or rel_posix.startswith('robot/'):
+            continue
+        if parts and parts[0] in skip_top_level:
+            continue
+        if any(part in skip_top_level for part in parts[:-1]):
+            continue
+        if any(part.startswith('.') for part in parts[:-1]):
+            continue
+        if path.name.startswith('.'):
+            continue
+        if path.suffix.lower() not in allowed_suffixes:
+            continue
+        if should_skip_upload_file(path, rel_posix):
+            continue
+
+        # Only keep Python files that live inside additional package folders.
+        # Ignore stray top-level helper scripts such as drive_straight.py.
+        if len(parts) < 2:
             continue
 
         dest = stage / rel
@@ -170,21 +275,29 @@ def build_staged_runtime_project(source_root: str | Path):
 
     return tmp, stage
 
-def is_editor_project_root(path):
+def is_editor_project_root(path: str | Path) -> bool:
     """
-    Determines if a folder is a valid student project.
+    Determine whether a folder is one of the desktop editor student projects.
 
-    A valid project:
-    - contains a main.py (student file)
-    - may contain subfolders (assets, modules, etc.)
+    Only folders inside the managed projects/ root count as editor projects.
+    This prevents the teleop application root itself from being mistaken for a
+    student project just because it also contains a main.py file.
     """
-
-    if not os.path.isdir(path):
+    try:
+        p = Path(path).resolve()
+        projects_root = projects_root_dir().resolve()
+    except Exception:
         return False
 
-    main_file = os.path.join(path, "main.py")
+    if not p.is_dir():
+        return False
 
-    return os.path.isfile(main_file)
+    try:
+        p.relative_to(projects_root)
+    except Exception:
+        return False
+
+    return (p / 'main.py').is_file() or (p / 'user_main.py').is_file()
 try:
     from PyQt6.QtWebEngineWidgets import QWebEngineView
     from PyQt6.QtWebChannel import QWebChannel
@@ -547,25 +660,28 @@ def iter_project_files(source_root: str | Path) -> list[tuple[Path, str]]:
     if not root.exists() or not root.is_dir():
         raise RuntimeError(f"Project root not found: {root}")
 
+    allowed_suffixes = {'.py', '.mpy'}
     skip_dir_names = {"__pycache__", ".git", ".idea", ".vscode", ".mypy_cache", ".pytest_cache", "node_modules", ".venv", "venv", "dist", "build"}
-    skip_suffixes = {".pyc", ".pyo", ".tmp", ".swp", ".bak"}
     files: list[tuple[Path, str]] = []
 
     for path in sorted(root.rglob('*')):
         if not path.is_file():
             continue
-        rel_parts = path.relative_to(root).parts
-        if any(part in skip_dir_names for part in rel_parts[:-1]):
+        rel = path.relative_to(root)
+        if any(part in skip_dir_names for part in rel.parts[:-1]):
             continue
-        if path.name.startswith('.') and path.name not in {'.env'}:
+        if any(part.startswith('.') for part in rel.parts[:-1]):
             continue
-        if path.suffix.lower() in skip_suffixes:
+        if path.name.startswith('.'):
             continue
-        rel = path.relative_to(root).as_posix()
-        if should_skip_upload_file(path, rel):
+        if path.suffix.lower() not in allowed_suffixes:
             continue
-        files.append((path, rel))
+        rel_posix = rel.as_posix()
+        if should_skip_upload_file(path, rel_posix):
+            continue
+        files.append((path, rel_posix))
 
+    files.sort(key=lambda item: item[1])
     return files
 
 
@@ -648,7 +764,11 @@ class Worker(QThread):
                         raise RuntimeError(f"main.py not found: {main_src}")
 
                     if not os.path.isfile(user_main_src):
-                        raise RuntimeError(f"user_main.py not found: {user_main_src}")
+                        raise RuntimeError(
+                            "user_main.py was not created in the staged deploy tree. "
+                            "If you are deploying a student project, select that specific project folder so its main.py can be copied to user_main.py. "
+                            f"Staged path checked: {user_main_src}"
+                        )
 
                     project_files = iter_project_files(deploy_root)
                     if not project_files:
@@ -800,6 +920,74 @@ class Worker(QThread):
 
         return "\n".join(out) + "\n"
 
+
+
+class SerialMonitorWorker(QThread):
+    log = pyqtSignal(str)
+    status = pyqtSignal(str)
+
+    def __init__(self, port: str, baud: int = 115200, duration_s: float = 15.0):
+        super().__init__()
+        self.port = str(port or "").strip()
+        self.baud = int(baud)
+        self.duration_s = float(duration_s)
+        self._stop_requested = False
+
+    def stop(self):
+        self._stop_requested = True
+
+    def run(self):
+        if not self.port:
+            self.status.emit("Serial monitor skipped: no serial port selected.")
+            return
+
+        try:
+            import serial
+        except Exception as e:
+            self.status.emit(f"Serial monitor unavailable: {e}")
+            return
+
+        ser = None
+        try:
+            self.status.emit(f"Opening serial log monitor on {self.port} @ {self.baud} baud...")
+            ser = serial.Serial(self.port, self.baud, timeout=0.25)
+            try:
+                ser.reset_input_buffer()
+            except Exception:
+                pass
+
+            deadline = time.time() + max(1.0, self.duration_s)
+            saw_output = False
+
+            while (not self._stop_requested) and time.time() < deadline:
+                try:
+                    raw = ser.readline()
+                except Exception as e:
+                    self.status.emit(f"Serial monitor read failed: {e}")
+                    break
+
+                if not raw:
+                    continue
+
+                saw_output = True
+                line = raw.decode("utf-8", errors="replace").rstrip()
+                if line:
+                    self.log.emit(f"[SERIAL] {line}")
+
+            if self._stop_requested:
+                self.status.emit("Serial log monitor stopped.")
+            elif saw_output:
+                self.status.emit("Serial log capture complete.")
+            else:
+                self.status.emit("Serial log monitor timed out with no output.")
+        except Exception as e:
+            self.status.emit(f"Serial monitor failed: {e}")
+        finally:
+            if ser is not None:
+                try:
+                    ser.close()
+                except Exception:
+                    pass
 
 class JobStatusDialog(QDialog):
     def __init__(self, parent=None):
@@ -1199,6 +1387,7 @@ class FlashDeployTab(QWidget):
     def __init__(self):
         super().__init__()
         self.worker: Worker | None = None
+        self.serial_monitor: SerialMonitorWorker | None = None
         self.status_dialog = JobStatusDialog(self)
         self._build()
 
@@ -1305,6 +1494,11 @@ class FlashDeployTab(QWidget):
         self.deploy_progress.setRange(0, 1)
         self.deploy_progress.setValue(0)
 
+        self.serial_log_hint = QLabel(
+            "After serial flash or deploy, teleop will briefly open the serial port and stream boot logs and Python tracebacks here automatically."
+        )
+        self.serial_log_hint.setWordWrap(True)
+
         self.log = QTextEdit()
         self.log.setReadOnly(True)
         self.log.setStyleSheet("font-family: Consolas, monospace;")
@@ -1316,6 +1510,7 @@ class FlashDeployTab(QWidget):
         layout.addLayout(actions)
         layout.addWidget(self.deploy_progress_label)
         layout.addWidget(self.deploy_progress)
+        layout.addWidget(self.serial_log_hint)
         layout.addWidget(QLabel("Log:"))
         layout.addWidget(self.log, 1)
 
@@ -1359,6 +1554,33 @@ class FlashDeployTab(QWidget):
         self.deploy_method.setEnabled(not busy)
         self.port_list.setEnabled((not busy) and is_serial)
         self.auto_scan_check.setEnabled((not busy) and is_serial)
+
+
+    def stop_serial_monitor(self):
+        if self.serial_monitor is not None:
+            try:
+                self.serial_monitor.stop()
+                self.serial_monitor.wait(1500)
+            except Exception:
+                pass
+            self.serial_monitor = None
+
+    def start_serial_monitor(self, port: str, baud: int = 115200, duration_s: float = 15.0):
+        port = (port or "").strip()
+        if not port or port.upper() in {"AUTO", "AUTO-DETECT", "AUTODETECT"}:
+            return
+        self.stop_serial_monitor()
+        self.append_log(f"Starting post-flash serial log capture on {port}...")
+        self.serial_monitor = SerialMonitorWorker(port=port, baud=baud, duration_s=duration_s)
+        self.serial_monitor.log.connect(self.append_log)
+        self.serial_monitor.log.connect(self.status_dialog.append_log)
+        self.serial_monitor.status.connect(self.on_serial_monitor_status)
+        self.serial_monitor.start()
+
+    def on_serial_monitor_status(self, text: str):
+        if text:
+            self.append_log(text)
+            self.status_dialog.append_log(text)
 
     def _format_port_candidate(self, info: dict) -> str:
         device = info.get("device", "?")
@@ -1519,6 +1741,7 @@ class FlashDeployTab(QWidget):
             QMessageBox.information(self, "Busy", "A job is already running.")
             return
 
+        self.stop_serial_monitor()
         self.append_log("\n==============================")
         self.append_log(f"Starting job: {job.kind}")
         method, target = self._describe_job(job)
@@ -1599,6 +1822,14 @@ class FlashDeployTab(QWidget):
                 QMessageBox.warning(self, "Missing main.py", f"Could not find:\n{main_py}")
                 return
 
+            if source_path == app_root_dir().resolve() and (source_path / "projects").is_dir():
+                QMessageBox.warning(
+                    self,
+                    "Select a specific project",
+                    "The selected folder is the teleop application root. Choose a specific student project folder inside projects/ or use the Project Editor's Configure + Deploy button so teleop can stage that project's main.py as user_main.py."
+                )
+                return
+
         if method == "serial":
             port = self.port_edit.text().strip()
             if not port or port.upper() in {"AUTO", "AUTO-DETECT", "AUTODETECT"}:
@@ -1676,16 +1907,32 @@ class FlashDeployTab(QWidget):
         self.do_deploy()
 
     def on_done(self, ok: bool, msg: str):
+        finished_job = self.worker.job if self.worker is not None else None
         self.set_busy(False)
         self.status_dialog.finish_job(ok, msg)
         if ok:
             self.deploy_progress.setValue(self.deploy_progress.maximum())
             self.deploy_progress_label.setText(msg or "Upload complete.")
             self.append_log(f"✅ {msg}")
+            if finished_job is not None and finished_job.kind in {"flash", "deploy"}:
+                serial_baud = 115200
+                self.start_serial_monitor(finished_job.port, baud=serial_baud, duration_s=20.0)
         else:
             self.deploy_progress_label.setText(msg or "Operation failed.")
             self.append_log(f"❌ {msg}")
             QMessageBox.critical(self, "Operation failed", msg)
+        self.worker = None
+
+    def closeEvent(self, event):
+        self.stop_serial_monitor()
+        if self.worker and self.worker.isRunning():
+            try:
+                self.worker.quit()
+                self.worker.wait(1000)
+            except Exception:
+                pass
+        super().closeEvent(event)
+
 
 
 # ============================================================

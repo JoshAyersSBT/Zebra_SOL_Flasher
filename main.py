@@ -17,7 +17,6 @@ from robot.config import (
 )
 from robot.motors import Motor
 from robot.servo import Servo
-from robot.drivetrain import DifferentialDrive
 from robot.ble_teleop import BleTeleop
 from robot.mpu6050 import MPU6050
 from robot.oled_status import OledStatus
@@ -37,14 +36,73 @@ from robot.debug_io import (
 
 SAFE_MODE_PIN = 0
 BOOT_GRACE_SECONDS = 3
+DEFAULT_STEER_CENTER_DEG = 90
+DEFAULT_STEER_RANGE_DEG = 45
 
 API = None
 zbot = None
 
 
+def _clamp(x, lo, hi):
+    return lo if x < lo else hi if x > hi else x
+
+
+class RuntimeDriveBridge:
+    """
+    Generic boot/runtime drive bridge used by BLE teleop and legacy calls.
+
+    This intentionally does not define the student's drive model.
+    It only provides a minimal motion bridge so:
+      - BLE teleop can command the robot
+      - legacy helpers still have a neutral fallback
+
+    Semantics:
+      throttle: -100..100
+      turn:     -100..100
+
+    Behavior:
+      - all propulsion motors receive the same signed throttle
+      - steering servo is mapped around center using turn
+    """
+    def __init__(self, api, propulsion_ports=None, steer_center_deg=DEFAULT_STEER_CENTER_DEG, steer_range_deg=DEFAULT_STEER_RANGE_DEG):
+        self.api = api
+        ports = propulsion_ports if propulsion_ports is not None else ACTIVE_MOTOR_PORTS
+        self.propulsion_ports = tuple(int(p) for p in ports)
+        self.steer_center_deg = int(steer_center_deg)
+        self.steer_range_deg = int(steer_range_deg)
+
+    def drive(self, throttle: int, turn: int):
+        throttle = _clamp(int(throttle), -100, 100)
+        turn = _clamp(int(turn), -100, 100)
+
+        for port in self.propulsion_ports:
+            try:
+                self.api.set_motor(port, throttle)
+            except Exception as e:
+                error("RUNTIME_DRIVE_PORT_{}".format(port), e)
+
+        steer_angle = self.steer_center_deg + ((turn * self.steer_range_deg) // 100)
+        try:
+            self.api.set_steering(steer_angle)
+        except Exception as e:
+            error("RUNTIME_DRIVE_STEER", e)
+
+    def stop(self):
+        for port in self.propulsion_ports:
+            try:
+                self.api.stop_motor(port)
+            except Exception as e:
+                error("RUNTIME_DRIVE_STOP_{}".format(port), e)
+
+
 class RobotAPI:
     """
-    Shared runtime API exposed to user programs and internal services.
+    Shared low-level runtime API exposed to user programs and internal services.
+
+    This API intentionally avoids hard-coding a student-facing drive model.
+    User code should compose motion behavior in robot modules such as:
+      - robot.ackermann
+      - robot.differential
     """
 
     def __init__(self):
@@ -109,6 +167,12 @@ class RobotAPI:
     def get_motor_feedback(self):
         return self.status.get("motor_feedback", {})
 
+    def _power_to_duty(self, power):
+        mag = abs(int(power))
+        if mag > 100:
+            mag = 100
+        return (mag * MOTOR_MAX_DUTY_U16) // 100
+
     def set_motor(self, port, power):
         motors = self.handles.get("motors", {})
         motor = motors.get(port)
@@ -116,48 +180,54 @@ class RobotAPI:
             raise ValueError("unknown motor port {}".format(port))
 
         power = int(power)
-        motor.set_power(power)
+
+        if hasattr(motor, "set_power"):
+            motor.set_power(power)
+        else:
+            if power == 0:
+                if hasattr(motor, "stop"):
+                    motor.stop()
+                else:
+                    motor.set(True, 0)
+            else:
+                forward = power > 0
+                duty_u16 = self._power_to_duty(power)
+                motor.set(forward, duty_u16)
 
         self.status["motors"][port] = {
             "power": power,
+            "duty_u16": self._power_to_duty(power),
             "ts_ms": time.ticks_ms(),
             "name": self.get_motor_map().get(port, {}).get("name", "M{}".format(port)),
         }
         return self.status["motors"][port]
 
     def stop_motor(self, port):
-        return self.set_motor(port, 0)
+        motors = self.handles.get("motors", {})
+        motor = motors.get(port)
+        if motor is None:
+            raise ValueError("unknown motor port {}".format(port))
+
+        if hasattr(motor, "stop"):
+            motor.stop()
+        else:
+            motor.set(True, 0)
+
+        self.status["motors"][port] = {
+            "power": 0,
+            "duty_u16": 0,
+            "ts_ms": time.ticks_ms(),
+            "name": self.get_motor_map().get(port, {}).get("name", "M{}".format(port)),
+        }
+        return self.status["motors"][port]
 
     def stop_all(self):
         motors = self.handles.get("motors", {})
         for port in motors:
             try:
-                self.set_motor(port, 0)
+                self.stop_motor(port)
             except Exception as e:
                 error("STOP_MOTOR_{}".format(port), e)
-
-        drive = self.handles.get("drive")
-        if drive is not None:
-            try:
-                drive.stop()
-            except Exception:
-                pass
-
-    def drive_tank(self, left_power, right_power):
-        drive = self.handles.get("drive")
-        if drive is None:
-            raise RuntimeError("drive unavailable")
-
-        left_power = int(left_power)
-        right_power = int(right_power)
-        drive.tank(left_power, right_power)
-        self.status["drive"] = {
-            "mode": "tank",
-            "left": left_power,
-            "right": right_power,
-            "ts_ms": time.ticks_ms(),
-        }
-        return self.status["drive"]
 
     def set_steering(self, angle):
         steer = self.handles.get("steer")
@@ -165,7 +235,13 @@ class RobotAPI:
             raise RuntimeError("steering unavailable")
 
         angle = int(angle)
-        steer.write_angle(angle)
+        if hasattr(steer, "write_angle"):
+            steer.write_angle(angle)
+        elif hasattr(steer, "angle"):
+            steer.angle(angle)
+        else:
+            raise AttributeError("steering object has no write_angle/angle")
+
         self.status["steering"] = {
             "angle": angle,
             "ts_ms": time.ticks_ms(),
@@ -197,7 +273,13 @@ class RobotAPI:
             return None
 
         try:
-            reading = imu.read()
+            if hasattr(imu, "read_scaled"):
+                reading = imu.read_scaled()
+            elif hasattr(imu, "read"):
+                reading = imu.read()
+            else:
+                raise AttributeError("imu object has no read_scaled/read")
+
             self.status["imu"] = {
                 "value": reading,
                 "ts_ms": time.ticks_ms(),
@@ -232,6 +314,26 @@ class RobotAPI:
             error("API_OLED", e)
             return False
 
+    # Compatibility shims so old student code fails less harshly.
+    def drive(self, throttle, turn=0):
+        bridge = self.handles.get("runtime_drive")
+        if bridge is None:
+            raise RuntimeError("runtime drive bridge unavailable")
+        bridge.drive(int(throttle), int(turn))
+
+    def stop(self):
+        self.stop_all()
+
+    def display(self, line1="", line2="", line3="", line4=""):
+        lines = [str(x) for x in (line1, line2, line3, line4) if str(x) != ""]
+        return self.show_lines(*lines)
+
+    def sensor(self, port):
+        return _ZBotSensor(self, port)
+
+    def motor(self, port, motor_type="DC"):
+        return _ZBotMotor(self, port, motor_type)
+
 
 class _ZBotSensor:
     def __init__(self, api, port):
@@ -239,6 +341,9 @@ class _ZBotSensor:
         self.port = int(port)
 
     def _find_snapshot_value(self):
+        if self.api is None:
+            return None
+
         sensors = self.api.get_sensor_snapshot()
 
         key = "tof_port_{}".format(self.port)
@@ -337,6 +442,12 @@ class _ZBotMotor:
 
 
 class ZBot:
+    """
+    Student-facing neutral wrapper.
+
+    This wrapper exposes primitives only. Drive-model decisions belong in
+    user modules (robot.ackermann, robot.differential, etc).
+    """
     def __init__(self, api=None):
         self.api = api
         self._motor_wrappers = {}
@@ -348,32 +459,32 @@ class ZBot:
     def ready(self):
         return self.api is not None and bool(self.api.status["system"].get("ready", False))
 
-    def forward(self, power=50):
-        if self.api is None:
-            return False
-        self.api.drive_tank(int(power), int(power))
-        return True
-
-    def backward(self, power=50):
-        if self.api is None:
-            return False
-        p = int(power)
-        self.api.drive_tank(-p, -p)
-        return True
-
-    def tank(self, left_power, right_power):
-        if self.api is None:
-            return False
-        self.api.drive_tank(int(left_power), int(right_power))
-        return True
-
     def stop(self):
         if self.api is None:
             return False
         self.api.stop_all()
         return True
 
-    def motors(self, port, motor_type="DC"):
+    def steer(self, angle):
+        if self.api is None:
+            return False
+        self.api.set_steering(int(angle))
+        return True
+
+    def display(self, line1="", line2="", line3="", line4=""):
+        if self.api is None:
+            return False
+        return self.api.display(line1, line2, line3, line4)
+
+    def say(self, line1="", line2="", line3="", line4=""):
+        return self.display(line1, line2, line3, line4)
+
+    def notify(self, text):
+        if self.api is None:
+            return False
+        return self.api.notify(str(text))
+
+    def motor(self, port, motor_type="DC"):
         key = (int(port), str(motor_type))
         if self.api is None:
             return _ZBotMotor(None, port, motor_type)
@@ -383,16 +494,8 @@ class ZBot:
 
         return self._motor_wrappers[key]
 
-    def motor(self, port, motor_type="DC"):
-        return self.motors(port, motor_type)
-
-    def display(self, line1="", line2=""):
-        if self.api is None:
-            return False
-        return self.api.show_lines(str(line1), str(line2))
-
-    def say(self, line1="", line2=""):
-        return self.display(line1, line2)
+    def motors(self, port, motor_type="DC"):
+        return self.motor(port, motor_type)
 
     def sensor(self, port):
         if self.api is None:
@@ -413,6 +516,11 @@ class ZBot:
             return {}
         return self.api.get_sensor_snapshot()
 
+    def imu(self):
+        if self.api is None:
+            return {}
+        return self.api.get_imu()
+
     def motor_status(self):
         if self.api is None:
             return {}
@@ -422,6 +530,26 @@ class ZBot:
         if self.api is None:
             return {}
         return self.api.get_motor_feedback()
+
+    # Backward-compatible motion shims. They use the neutral runtime bridge.
+    def drive(self, throttle, turn=0):
+        if self.api is None:
+            return False
+        self.api.drive(int(throttle), int(turn))
+        return True
+
+    def forward(self, power=50):
+        return self.drive(abs(int(power)), 0)
+
+    def backward(self, power=50):
+        return self.drive(-abs(int(power)), 0)
+
+    def tank(self, left_power, right_power):
+        left_power = int(left_power)
+        right_power = int(right_power)
+        throttle = (left_power + right_power) // 2
+        turn = (left_power - right_power) // 2
+        return self.drive(throttle, turn)
 
 
 def get_api():
@@ -509,7 +637,6 @@ def _sensor_port_line(api, port):
         if value is not None:
             return "P{} {}".format(port, str(value)[:10])
 
-    # broader fallback search
     for key, item in sensors.items():
         if not isinstance(item, dict):
             continue
@@ -693,7 +820,7 @@ async def _run_user_program(api):
         if argc == 0:
             await user_fn()
         else:
-            await user_fn(api)
+            await user_fn(zbot)
 
     except Exception as e:
         api.status["user"]["last_error"] = repr(e)
@@ -725,8 +852,7 @@ async def main():
     oled = None
     mux = None
     base_i2c = None
-    drive = None
-    steer = None
+    runtime_drive = None
 
     motors = {}
     motor_feedback = None
@@ -759,17 +885,13 @@ async def main():
             )
             api.status["motors"][port] = {
                 "power": 0,
+                "duty_u16": 0,
                 "name": cfg.get("name", "M{}".format(port)),
                 "enc": cfg.get("enc"),
                 "ts_ms": time.ticks_ms(),
             }
 
-        left = motors[1]
-        right = motors[2]
-        drive = DifferentialDrive(left, right, max_duty_u16=MOTOR_MAX_DUTY_U16)
-
         api.register_handle("motors", motors)
-        api.register_handle("drive", drive)
         api.register_handle("motor_port_map", dict(MOTOR_PORT_MAP))
 
         info("BOOT: motors initialized")
@@ -796,6 +918,12 @@ async def main():
     except Exception as e:
         error("SERVO_INIT", e)
         raise
+
+    try:
+        runtime_drive = RuntimeDriveBridge(api, propulsion_ports=ACTIVE_MOTOR_PORTS)
+        api.register_handle("runtime_drive", runtime_drive)
+    except Exception as e:
+        error("RUNTIME_DRIVE_INIT", e)
 
     try:
         base_i2c = I2C(
@@ -876,7 +1004,7 @@ async def main():
 
     try:
         teleop = BleTeleop(
-            drive=drive,
+            drive=runtime_drive,
             steering=steer,
             imu=imu,
             imu_period_ms=MPU_PERIOD_MS,
