@@ -13,7 +13,7 @@
 #define GitHubBranch "main"
 #define MainScript "teleop.py"
 #define RequirementsFile "requirements.txt"
-#define FallbackPipPackages "PyQt6 PyQt6-WebEngine bleak pyserial pygments"
+#define FallbackPipPackages "PyQt6 PyQt6-WebEngine bleak pyserial pygments esptool mpremote pyright"
 
 [Setup]
 AppId={#AppId}
