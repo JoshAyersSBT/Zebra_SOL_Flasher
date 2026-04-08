@@ -4,11 +4,9 @@ class Motor:
     """
     Simple direction + PWM motor.
 
-    Public control API:
-      - set_power(power): signed percent-style power, -100..100
-      - set(forward, duty_u16): low-level direct control
-      - stop()
-      - deinit()
+    Active-low PWM:
+      duty 0      -> full on
+      duty 65535  -> off
     """
 
     def __init__(self, pwm_gpio: int, dir_gpio: int, pwm_freq_hz: int = 20000):
@@ -23,18 +21,11 @@ class Motor:
             duty_u16 = 65535
 
         self._dir.value(1 if forward else 0)
-        self._pwm.duty_u16(duty_u16)
+
+        # Inverted PWM
+        self._pwm.duty_u16(65535 - duty_u16)
 
     def set_power(self, power: int):
-        """
-        Signed power command expected by main.py / RobotAPI.
-
-        power:
-          -100 .. 100
-             0 stops the motor
-            >0 forward
-            <0 reverse
-        """
         power = int(power)
 
         if power == 0:
@@ -50,7 +41,7 @@ class Motor:
         self.set(forward, duty_u16)
 
     def stop(self):
-        self._pwm.duty_u16(0)
+        self._pwm.duty_u16(65535)
 
     def deinit(self):
         try:

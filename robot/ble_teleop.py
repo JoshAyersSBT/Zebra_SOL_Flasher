@@ -122,6 +122,11 @@ class BleTeleop:
         self._tx_queue_max = 80
         self._tx_drop_count = 0
 
+        # BLE should not interrupt user code unless BLE has actively taken
+        # control of motion and stop_on_disconnect is enabled.
+        self.stop_on_disconnect = False
+        self._ble_motion_active = False
+
         # Important for file upload:
         # allow longer BLE writes to accumulate instead of truncating.
         try:
@@ -301,11 +306,9 @@ class BleTeleop:
         print("BLE connected")
         self.notify_info("BLE connected")
 
-        try:
-            replay_boot_log()
-        except Exception as e:
-            self.notify_error("BOOT_LOG", e)
-
+        # Do not replay the boot log on BLE connect. Replaying old boot lines
+        # like "Starting BLE" makes it look like the supervisor restarted and
+        # can interfere with the OLED/user experience.
         if self._tx_drop_count:
             self.notify_line("WARN TX dropped {}".format(self._tx_drop_count))
             self._tx_drop_count = 0
@@ -333,22 +336,26 @@ class BleTeleop:
             self.notify_error("OLED_CLEAR", e)
 
     def _on_disconnected(self):
-        print("BLE disconnected -> stopping robot")
+        print("BLE disconnected")
         self._abort_upload(silent=True)
 
-        try:
-            self.drive.stop()
-        except Exception as e:
-            self.notify_error("DRIVE_STOP", e)
+        # Only stop motion on disconnect if BLE was actively commanding motion
+        # and the caller explicitly opted into that behavior.
+        if self.stop_on_disconnect and self._ble_motion_active:
+            try:
+                self.drive.stop()
+            except Exception as e:
+                self.notify_error("DRIVE_STOP", e)
 
-        try:
-            self.steering.angle(SERVO_CENTER_DEG)
-        except Exception as e:
-            self.notify_error("STEER_CENTER", e)
+            try:
+                self.steering.angle(SERVO_CENTER_DEG)
+            except Exception as e:
+                self.notify_error("STEER_CENTER", e)
 
         if self.oled:
             self._oled_temp_message("ZebraBot", "Disconnected", hold_ms=700, clear_after=True)
 
+        self._ble_motion_active = False
         self._tx_queue = []
         self._rx_buf = b""
         self._advertise()
@@ -563,6 +570,7 @@ class BleTeleop:
                 return
 
             if line == "STOP":
+                self._ble_motion_active = True
                 self.drive.stop()
                 return
 
@@ -618,6 +626,7 @@ class BleTeleop:
                     return
                 throttle = int(parts[1])
                 turn = int(parts[2])
+                self._ble_motion_active = True
                 self.drive.drive(throttle, turn)
                 return
 
@@ -627,6 +636,7 @@ class BleTeleop:
                     self._notify("ERR CMD bad S format")
                     return
                 ang = int(parts[1])
+                self._ble_motion_active = True
                 self.steering.angle(ang)
                 return
 

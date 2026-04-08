@@ -307,7 +307,7 @@ class RobotAPI:
         if oled is None:
             return False
         try:
-            self.mark_user_display()
+            self.mark_user_display(hold_ms=5000)
             oled.show_lines(*lines)
             return True
         except Exception as e:
@@ -389,6 +389,22 @@ class _ZBotSensor:
     def read(self):
         return self._find_snapshot_value()
 
+class _ZBotServo:
+    def __init__(self, api, port=1):
+        self.api = api
+        self.port = int(port)
+
+    def write_angle(self, angle):
+        if self.api is None:
+            return False
+        self.api.set_steering(int(angle))
+        return True
+
+    def angle(self, angle):
+        return self.write_angle(angle)
+
+    def center(self, center_angle=90):
+        return self.write_angle(int(center_angle))
 
 class _ZBotMotor:
     def __init__(self, api, port, motor_type="DC"):
@@ -483,6 +499,11 @@ class ZBot:
         if self.api is None:
             return False
         return self.api.notify(str(text))
+    
+    def servo(self, port=1):
+        if self.api is None:
+            return _ZBotServo(None, port)
+        return _ZBotServo(self.api, port)
 
     def motor(self, port, motor_type="DC"):
         key = (int(port), str(motor_type))
@@ -562,6 +583,17 @@ def get_zbot():
 
 def _boot_oled(api, line1, line2="", line3=""):
     try:
+        if api is None:
+            return
+
+        # Never let boot messages overwrite the display once boot is done.
+        if api.status.get("boot", {}).get("state") == "complete":
+            return
+
+        # Never interrupt an active user display hold.
+        if api.user_display_active():
+            return
+
         oled = api.get_handle("oled")
         if oled is not None and getattr(oled, "available", False):
             oled.show_lines(line1, line2, line3)
@@ -730,6 +762,15 @@ async def _oled_status_task(api):
 
             if api.user_display_active():
                 await asyncio.sleep_ms(200)
+                continue
+
+            user = api.status.get("user", {})
+            fallback_mode = (not user.get("running")) or bool(user.get("last_error"))
+
+            # If the user program is running and not in fallback mode,
+            # do not let the status task repaint the OLED.
+            if user.get("running") and not user.get("last_error"):
+                await asyncio.sleep_ms(250)
                 continue
 
             user = api.status.get("user", {})
