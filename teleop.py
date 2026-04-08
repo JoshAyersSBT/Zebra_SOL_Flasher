@@ -3102,22 +3102,44 @@ class ProjectEditorTab(QWidget):
             init_py.write_text("# Local robot helpers for desktop authoring.\n", encoding="utf-8")
 
         (project_dir / "main.py").write_text(
-            "from main import zbot\n"
-            "import uasyncio as asyncio\n\n"
-            "async def main():\n"
-            "    tof = zbot.sensor(1)\n\n"
-            "    while True:\n"
-            "        d = tof.read()\n\n"
-            "        if d is None:\n"
-            "            zbot.stop()\n"
-            "            zbot.display('NO SENSOR', '')\n"
-            "        elif d < 100:\n"
-            "            zbot.stop()\n"
-            "            zbot.display('STOP', d)\n"
-            "        else:\n"
-            "            zbot.forward(60)\n"
-            "            zbot.display('GO', d)\n\n"
-            "        await asyncio.sleep_ms(50)\n",
+            '''
+            import uasyncio as asyncio
+            import gc
+            from robot.ackermann import AckermannDrive
+
+            async def main(zbot):
+                gc.collect()
+
+                # Explicit hardware definition
+                drive = AckermannDrive(
+                    zbot,
+                    drive_motor_port=1,
+                    steering_port=2,
+                    center_angle=90
+                )
+
+                tof = zbot.sensor(1)
+
+                drive.steer_center()
+
+                while True:
+                    d = tof.read()
+
+                    if d is None:
+                        drive.stop()
+                        drive.steer_center()
+                        zbot.display("NO SENSOR", "")
+                    elif d < 100:
+                        drive.stop()
+                        drive.steer_center()
+                        zbot.display("STOP", str(d))
+                    else:
+                        drive.forward(60)
+                        drive.steer_center()
+                        zbot.display("GO", str(d))
+
+                    await asyncio.sleep_ms(50)
+            ''',
             encoding="utf-8",
         )
 
