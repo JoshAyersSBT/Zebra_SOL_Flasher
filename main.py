@@ -2,19 +2,8 @@ import time
 import uasyncio as asyncio
 from machine import I2C, Pin
 
-from robot.config import (
-    LEFT_PWM, LEFT_DIR, LEFT_ENC,
-    RIGHT_PWM, RIGHT_DIR, RIGHT_ENC,
-    MOTOR_PWM_FREQ_HZ, MOTOR_MAX_DUTY_U16,
-    STEER_SERVO_GPIO, SERVO_FREQ_HZ, SERVO_MIN_US, SERVO_MAX_US,
-    TCA_I2C_ID, TCA_SDA_GPIO, TCA_SCL_GPIO, TCA_I2C_FREQ, TCA_ADDR,
-    MPU_ADDR, MPU_CHANNEL, MPU_PERIOD_MS,
-    OLED_ADDR, OLED_CHANNEL, OLED_WIDTH, OLED_HEIGHT,
-    SENSOR_SCAN_PERIOD_MS, SENSOR_PORT_MODES,
-    MOTOR_PORT_MAP, ACTIVE_MOTOR_PORTS,
-    MOTOR_SCAN_POWER, MOTOR_SCAN_PULSE_MS, MOTOR_SCAN_PERIOD_MS,
-    MOTOR_FEEDBACK_PERIOD_MS,
-)
+import robot.config as robot_config
+
 from robot.motors import Motor
 from robot.servo import Servo
 from robot.ble_teleop import BleTeleop
@@ -41,6 +30,76 @@ DEFAULT_STEER_RANGE_DEG = 45
 
 API = None
 zbot = None
+
+
+def _cfg(name, default=None):
+    return getattr(robot_config, name, default)
+
+
+LEFT_PWM = _cfg("LEFT_PWM")
+LEFT_DIR = _cfg("LEFT_DIR")
+LEFT_ENC = _cfg("LEFT_ENC")
+
+RIGHT_PWM = _cfg("RIGHT_PWM")
+RIGHT_DIR = _cfg("RIGHT_DIR")
+RIGHT_ENC = _cfg("RIGHT_ENC")
+
+MOTOR_PWM_FREQ_HZ = _cfg("MOTOR_PWM_FREQ_HZ", 20000)
+MOTOR_MAX_DUTY_U16 = _cfg("MOTOR_MAX_DUTY_U16", 40000)
+
+STEER_SERVO_GPIO = _cfg("STEER_SERVO_GPIO", 18)
+SERVO_FREQ_HZ = _cfg("SERVO_FREQ_HZ", 50)
+SERVO_MIN_US = _cfg("SERVO_MIN_US", 500)
+SERVO_MAX_US = _cfg("SERVO_MAX_US", 2500)
+SERVO_CENTER_DEG = _cfg("SERVO_CENTER_DEG", 90)
+
+TCA_I2C_ID = _cfg("TCA_I2C_ID", 0)
+TCA_SDA_GPIO = _cfg("TCA_SDA_GPIO", 21)
+TCA_SCL_GPIO = _cfg("TCA_SCL_GPIO", 22)
+TCA_I2C_FREQ = _cfg("TCA_I2C_FREQ", 400000)
+TCA_ADDR = _cfg("TCA_ADDR", 0x70)
+
+MPU_ADDR = _cfg("MPU_ADDR", 0x68)
+MPU_CHANNEL = _cfg("MPU_CHANNEL", 7)
+MPU_PERIOD_MS = _cfg("MPU_PERIOD_MS", 10)
+
+OLED_ADDR = _cfg("OLED_ADDR", 0x3C)
+OLED_CHANNEL = _cfg("OLED_CHANNEL", 0)
+OLED_WIDTH = _cfg("OLED_WIDTH", 128)
+OLED_HEIGHT = _cfg("OLED_HEIGHT", 64)
+
+SENSOR_SCAN_PERIOD_MS = _cfg("SENSOR_SCAN_PERIOD_MS", 100)
+SENSOR_PORT_MODES = _cfg("SENSOR_PORT_MODES", {})
+
+MOTOR_PORT_MAP = _cfg("MOTOR_PORT_MAP", {})
+ACTIVE_MOTOR_PORTS = _cfg("ACTIVE_MOTOR_PORTS", tuple(sorted(MOTOR_PORT_MAP.keys())))
+
+MOTOR_SCAN_POWER = _cfg("MOTOR_SCAN_POWER", 25)
+MOTOR_SCAN_PULSE_MS = _cfg("MOTOR_SCAN_PULSE_MS", 250)
+MOTOR_SCAN_PERIOD_MS = _cfg("MOTOR_SCAN_PERIOD_MS", 1500)
+MOTOR_FEEDBACK_PERIOD_MS = _cfg("MOTOR_FEEDBACK_PERIOD_MS", 200)
+
+# Optional future-facing config. Falls back cleanly to the legacy dedicated steer servo.
+SERVO_PORT_MAP = _cfg("SERVO_PORT_MAP", None)
+STEER_SERVO_PORT = _cfg("STEER_SERVO_PORT", 1)
+
+
+def _build_default_servo_port_map():
+    return {
+        int(STEER_SERVO_PORT): {
+            "name": "STEER",
+            "gpio": int(STEER_SERVO_GPIO),
+            "freq_hz": int(SERVO_FREQ_HZ),
+            "min_us": int(SERVO_MIN_US),
+            "max_us": int(SERVO_MAX_US),
+            "center_deg": int(SERVO_CENTER_DEG),
+            "role": "steering",
+        }
+    }
+
+
+if SERVO_PORT_MAP is None:
+    SERVO_PORT_MAP = _build_default_servo_port_map()
 
 
 def _clamp(x, lo, hi):
@@ -110,6 +169,7 @@ class RobotAPI:
             "boot": {"state": "init", "safe_mode": False},
             "system": {"heartbeat": 0, "ready": False},
             "motors": {},
+            "servos": {},
             "steering": {},
             "imu": {},
             "sensors": {},
@@ -166,6 +226,15 @@ class RobotAPI:
 
     def get_motor_feedback(self):
         return self.status.get("motor_feedback", {})
+
+    def get_servo_ports(self):
+        return sorted(self.handles.get("servos", {}).keys())
+
+    def get_servo_map(self):
+        return self.handles.get("servo_port_map", {})
+
+    def get_servo_status(self):
+        return self.status.get("servos", {})
 
     def _power_to_duty(self, power):
         mag = abs(int(power))
@@ -229,6 +298,35 @@ class RobotAPI:
             except Exception as e:
                 error("STOP_MOTOR_{}".format(port), e)
 
+    def set_servo(self, port, angle):
+        servos = self.handles.get("servos", {})
+        servo = servos.get(int(port))
+        if servo is None:
+            raise ValueError("unknown servo port {}".format(port))
+
+        angle = int(angle)
+
+        if hasattr(servo, "write_angle"):
+            servo.write_angle(angle)
+        elif hasattr(servo, "angle"):
+            servo.angle(angle)
+        else:
+            raise AttributeError("servo object has no write_angle/angle")
+
+        cfg = self.get_servo_map().get(int(port), {})
+        item = {
+            "angle": angle,
+            "ts_ms": time.ticks_ms(),
+            "name": cfg.get("name", "S{}".format(port)),
+        }
+        self.status["servos"][int(port)] = item
+        return item
+
+    def center_servo(self, port):
+        cfg = self.get_servo_map().get(int(port), {})
+        center_deg = int(cfg.get("center_deg", 90))
+        return self.set_servo(int(port), center_deg)
+
     def set_steering(self, angle):
         steer = self.handles.get("steer")
         if steer is None:
@@ -246,6 +344,18 @@ class RobotAPI:
             "angle": angle,
             "ts_ms": time.ticks_ms(),
         }
+
+        steer_port = self.handles.get("steer_port", None)
+        if steer_port is not None:
+            try:
+                self.status["servos"][int(steer_port)] = {
+                    "angle": angle,
+                    "ts_ms": time.ticks_ms(),
+                    "name": self.get_servo_map().get(int(steer_port), {}).get("name", "STEER"),
+                }
+            except Exception:
+                pass
+
         return self.status["steering"]
 
     def publish_sensor(self, name, value, meta=None):
@@ -334,6 +444,9 @@ class RobotAPI:
     def motor(self, port, motor_type="DC"):
         return _ZBotMotor(self, port, motor_type)
 
+    def servo(self, port=1):
+        return _ZBotServo(self, port)
+
 
 class _ZBotSensor:
     def __init__(self, api, port):
@@ -389,22 +502,30 @@ class _ZBotSensor:
     def read(self):
         return self._find_snapshot_value()
 
+
 class _ZBotServo:
     def __init__(self, api, port=1):
         self.api = api
         self.port = int(port)
 
-    def write_angle(self, angle):
+    def angle(self, deg):
         if self.api is None:
             return False
-        self.api.set_steering(int(angle))
+        self.api.set_servo(self.port, int(deg))
         return True
 
-    def angle(self, angle):
-        return self.write_angle(angle)
+    def write_angle(self, deg):
+        return self.angle(deg)
 
-    def center(self, center_angle=90):
-        return self.write_angle(int(center_angle))
+    def center(self, center_angle=None):
+        if self.api is None:
+            return False
+        if center_angle is None:
+            self.api.center_servo(self.port)
+        else:
+            self.api.set_servo(self.port, int(center_angle))
+        return True
+
 
 class _ZBotMotor:
     def __init__(self, api, port, motor_type="DC"):
@@ -467,6 +588,7 @@ class ZBot:
     def __init__(self, api=None):
         self.api = api
         self._motor_wrappers = {}
+        self._servo_wrappers = {}
 
     def bind(self, api):
         self.api = api
@@ -499,11 +621,16 @@ class ZBot:
         if self.api is None:
             return False
         return self.api.notify(str(text))
-    
+
     def servo(self, port=1):
+        key = int(port)
         if self.api is None:
             return _ZBotServo(None, port)
-        return _ZBotServo(self.api, port)
+
+        if key not in self._servo_wrappers:
+            self._servo_wrappers[key] = _ZBotServo(self.api, port)
+
+        return self._servo_wrappers[key]
 
     def motor(self, port, motor_type="DC"):
         key = (int(port), str(motor_type))
@@ -552,6 +679,11 @@ class ZBot:
             return {}
         return self.api.get_motor_feedback()
 
+    def servo_status(self):
+        if self.api is None:
+            return {}
+        return self.api.get_servo_status()
+
     # Backward-compatible motion shims. They use the neutral runtime bridge.
     def drive(self, throttle, turn=0):
         if self.api is None:
@@ -586,11 +718,9 @@ def _boot_oled(api, line1, line2="", line3=""):
         if api is None:
             return
 
-        # Never let boot messages overwrite the display once boot is done.
         if api.status.get("boot", {}).get("state") == "complete":
             return
 
-        # Never interrupt an active user display hold.
         if api.user_display_active():
             return
 
@@ -727,7 +857,7 @@ async def _api_housekeeping_task(api):
     while True:
         try:
             motor_feedback = api.get_handle("motor_feedback")
-            if motor_feedback is not None:
+            if motor_feedback is not None and hasattr(motor_feedback, "snapshot"):
                 api.status["motor_feedback"] = motor_feedback.snapshot()
         except Exception:
             pass
@@ -767,14 +897,9 @@ async def _oled_status_task(api):
             user = api.status.get("user", {})
             fallback_mode = (not user.get("running")) or bool(user.get("last_error"))
 
-            # If the user program is running and not in fallback mode,
-            # do not let the status task repaint the OLED.
             if user.get("running") and not user.get("last_error"):
                 await asyncio.sleep_ms(250)
                 continue
-
-            user = api.status.get("user", {})
-            fallback_mode = (not user.get("running")) or bool(user.get("last_error"))
 
             if fallback_mode:
                 pages = _sensor_overview_pages(api)
@@ -894,8 +1019,10 @@ async def main():
     mux = None
     base_i2c = None
     runtime_drive = None
+    steer = None
 
     motors = {}
+    servos = {}
     motor_feedback = None
     motor_scanner = None
 
@@ -945,17 +1072,60 @@ async def main():
         raise
 
     try:
-        steer = Servo(
-            STEER_SERVO_GPIO,
-            freq_hz=SERVO_FREQ_HZ,
-            min_us=SERVO_MIN_US,
-            max_us=SERVO_MAX_US,
-        )
+        for port in sorted(SERVO_PORT_MAP.keys()):
+            cfg = SERVO_PORT_MAP[port]
+            servos[port] = Servo(
+                int(cfg.get("gpio", STEER_SERVO_GPIO)),
+                freq_hz=int(cfg.get("freq_hz", SERVO_FREQ_HZ)),
+                min_us=int(cfg.get("min_us", SERVO_MIN_US)),
+                max_us=int(cfg.get("max_us", SERVO_MAX_US)),
+            )
+            api.status["servos"][port] = {
+                "angle": None,
+                "ts_ms": time.ticks_ms(),
+                "name": cfg.get("name", "S{}".format(port)),
+            }
+            diag(
+                "SERVO_PORT {} {} gpio={} freq={} min_us={} max_us={}".format(
+                    port,
+                    cfg.get("name", "S{}".format(port)),
+                    cfg.get("gpio", STEER_SERVO_GPIO),
+                    cfg.get("freq_hz", SERVO_FREQ_HZ),
+                    cfg.get("min_us", SERVO_MIN_US),
+                    cfg.get("max_us", SERVO_MAX_US),
+                )
+            )
+
+        api.register_handle("servos", servos)
+        api.register_handle("servo_port_map", dict(SERVO_PORT_MAP))
+
+        steer_port = None
+        for port, cfg in SERVO_PORT_MAP.items():
+            if str(cfg.get("role", "")).lower() == "steering":
+                steer_port = int(port)
+                break
+        if steer_port is None and servos:
+            steer_port = sorted(servos.keys())[0]
+
+        if steer_port is None:
+            raise RuntimeError("no servo ports available")
+
+        steer = servos[steer_port]
         api.register_handle("steer", steer)
+        api.register_handle("steer_port", int(steer_port))
         api.status["steering"] = {"angle": None, "ts_ms": time.ticks_ms()}
-        info("BOOT: servo initialized")
-        diag("SERVO GPIO={}".format(STEER_SERVO_GPIO))
+        info("BOOT: servo(s) initialized")
         state("BOOT", "servo_ok")
+
+        try:
+            api.center_servo(steer_port)
+            api.status["steering"] = {
+                "angle": int(SERVO_PORT_MAP.get(steer_port, {}).get("center_deg", SERVO_CENTER_DEG)),
+                "ts_ms": time.ticks_ms(),
+            }
+        except Exception as center_err:
+            error("SERVO_CENTER_INIT", center_err)
+
     except Exception as e:
         error("SERVO_INIT", e)
         raise

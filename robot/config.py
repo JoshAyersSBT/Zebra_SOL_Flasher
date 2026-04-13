@@ -43,12 +43,31 @@ RIGHT_ENC = M2_ENC
 # ============================================================
 
 MOTOR_PORT_MAP = {
-    1: {"name": "M1", "pwm": M1_PWM, "dir": M1_DIR, "enc": M1_ENC},
-    2: {"name": "M2", "pwm": M2_PWM, "dir": M2_DIR, "enc": M2_ENC},
-    3: {"name": "M3", "pwm": M3_PWM, "dir": M3_DIR, "enc": M3_ENC},
-    4: {"name": "M4", "pwm": M4_PWM, "dir": M4_DIR, "enc": M4_ENC},
+    1: {
+        "name": "P1",
+        "pins": {"pwm": 23, "dir": 16, "enc": 17},
+        "supports": ["dc_motor", "servo"],
+        "default_mode": "dc_motor",
+    },
+    2: {
+        "name": "P2",
+        "pins": {"pwm": 13, "dir": 14, "enc": 34},
+        "supports": ["dc_motor", "servo"],
+        "default_mode": "dc_motor",
+    },
+    3: {
+        "name": "P3",
+        "pins": {"pwm": 25, "dir": 26, "enc": 27},
+        "supports": ["dc_motor", "servo"],
+        "default_mode": "dc_motor",
+    },
+    4: {
+        "name": "P4",
+        "pins": {"pwm": 33, "dir": 32, "enc": 35},
+        "supports": ["dc_motor", "servo"],
+        "default_mode": "dc_motor",
+    },
 }
-
 
 # Ports actively used by the drivetrain / BLE motor scan
 DRIVE_MOTOR_PORTS = (1, 2)

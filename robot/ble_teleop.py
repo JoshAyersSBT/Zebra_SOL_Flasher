@@ -140,7 +140,14 @@ class BleTeleop:
         except Exception:
             pass
 
-        self.steering.angle(SERVO_CENTER_DEG)
+        # Do not let steering-centering failures abort BLE construction.
+        try:
+            self._set_steering_angle(SERVO_CENTER_DEG)
+        except Exception as e:
+            try:
+                print("BLE steering init failed:", repr(e))
+            except Exception:
+                pass
 
         self._adv_data = _adv_payload(BLE_NAME, services=[_UART_UUID])
         self._advertise()
@@ -150,6 +157,41 @@ class BleTeleop:
             asyncio.create_task(self._tx_task())
         except Exception as e:
             print("BLE task start failed:", e)
+
+    def _set_steering_angle(self, angle):
+        if self.steering is None:
+            raise RuntimeError("steering unavailable")
+
+        ang = int(angle)
+        s = self.steering
+
+        if hasattr(s, "angle"):
+            s.angle(ang)
+            return
+        if hasattr(s, "write_angle"):
+            s.write_angle(ang)
+            return
+        if hasattr(s, "set_steering"):
+            s.set_steering(ang)
+            return
+        if callable(s):
+            s(ang)
+            return
+
+        raise AttributeError("steering object has no angle/write_angle/set_steering")
+
+    def _stop_drive(self):
+        if self.drive is None:
+            raise RuntimeError("drive unavailable")
+
+        if hasattr(self.drive, "stop"):
+            self.drive.stop()
+            return
+        if callable(self.drive):
+            self.drive(0, 0)
+            return
+
+        raise AttributeError("drive object has no stop")
 
     async def imu_task(self):
         """
@@ -191,8 +233,13 @@ class BleTeleop:
             # MicroPython commonly expects advertising interval in microseconds.
             self._ble.gap_advertise(100_000, adv_data=self._adv_data)
             print("BLE advertising as:", BLE_NAME)
-        except Exception as e:
-            print("BLE advertise failed:", e)
+        except Exception as first_err:
+            try:
+                # Fallback for builds that expect milliseconds.
+                self._ble.gap_advertise(100, adv_data=self._adv_data)
+                print("BLE advertising as:", BLE_NAME)
+            except Exception as second_err:
+                print("BLE advertise failed:", first_err, second_err)
 
     def _cancel_oled_msg(self):
         try:
@@ -306,9 +353,6 @@ class BleTeleop:
         print("BLE connected")
         self.notify_info("BLE connected")
 
-        # Do not replay the boot log on BLE connect. Replaying old boot lines
-        # like "Starting BLE" makes it look like the supervisor restarted and
-        # can interfere with the OLED/user experience.
         if self._tx_drop_count:
             self.notify_line("WARN TX dropped {}".format(self._tx_drop_count))
             self._tx_drop_count = 0
@@ -339,16 +383,14 @@ class BleTeleop:
         print("BLE disconnected")
         self._abort_upload(silent=True)
 
-        # Only stop motion on disconnect if BLE was actively commanding motion
-        # and the caller explicitly opted into that behavior.
         if self.stop_on_disconnect and self._ble_motion_active:
             try:
-                self.drive.stop()
+                self._stop_drive()
             except Exception as e:
                 self.notify_error("DRIVE_STOP", e)
 
             try:
-                self.steering.angle(SERVO_CENTER_DEG)
+                self._set_steering_angle(SERVO_CENTER_DEG)
             except Exception as e:
                 self.notify_error("STEER_CENTER", e)
 
@@ -571,7 +613,7 @@ class BleTeleop:
 
             if line == "STOP":
                 self._ble_motion_active = True
-                self.drive.stop()
+                self._stop_drive()
                 return
 
             if line == "IMU ON":
@@ -637,7 +679,7 @@ class BleTeleop:
                     return
                 ang = int(parts[1])
                 self._ble_motion_active = True
-                self.steering.angle(ang)
+                self._set_steering_angle(ang)
                 return
 
             if line.startswith("PUT_BEGIN "):
