@@ -1,7 +1,7 @@
 # robot/config.py
 
 # ============================================================
-# MOTOR PORT DEFINITIONS
+# MOTOR PORT DEFINITIONS (PHYSICAL PINOUT)
 # ============================================================
 
 # M1
@@ -26,98 +26,104 @@ M4_PWM = 33
 
 
 # ============================================================
-# DRIVE TRAIN (choose which motors drive the robot)
+# PORT / ACTUATOR MAP
 # ============================================================
 
-LEFT_PWM = M1_PWM
-LEFT_DIR = M1_DIR
-LEFT_ENC = M1_ENC
-
-RIGHT_PWM = M2_PWM
-RIGHT_DIR = M2_DIR
-RIGHT_ENC = M2_ENC
-
-
-# ============================================================
-# FULL MOTOR PORT MAP
-# ============================================================
-
-MOTOR_PORT_MAP = {
+PORT_MAP = {
     1: {
-        "name": "P1",
-        "pins": {"pwm": 23, "dir": 16, "enc": 17},
+        "name": "M1",
+        "pins": {"pwm": M1_PWM, "dir": M1_DIR, "enc": M1_ENC},
         "supports": ["dc_motor", "servo"],
         "default_mode": "dc_motor",
     },
     2: {
-        "name": "P2",
-        "pins": {"pwm": 13, "dir": 14, "enc": 34},
+        "name": "M2",
+        "pins": {"pwm": M2_PWM, "dir": M2_DIR, "enc": M2_ENC},
         "supports": ["dc_motor", "servo"],
         "default_mode": "dc_motor",
     },
     3: {
-        "name": "P3",
-        "pins": {"pwm": 25, "dir": 26, "enc": 27},
+        "name": "M3",
+        "pins": {"pwm": M3_PWM, "dir": M3_DIR, "enc": M3_ENC},
         "supports": ["dc_motor", "servo"],
         "default_mode": "dc_motor",
     },
     4: {
-        "name": "P4",
-        "pins": {"pwm": 33, "dir": 32, "enc": 35},
+        "name": "M4",
+        "pins": {"pwm": M4_PWM, "dir": M4_DIR, "enc": M4_ENC},
         "supports": ["dc_motor", "servo"],
         "default_mode": "dc_motor",
     },
 }
 
-# Ports actively used by the drivetrain / BLE motor scan
-DRIVE_MOTOR_PORTS = (1, 2)
+
 # ============================================================
-# FULL MOTOR PORT MAP
+# LEGACY MOTOR PORT MAP COMPATIBILITY
 # ============================================================
 
+# Keep this for older code paths that still expect flat pwm/dir/enc keys.
 MOTOR_PORT_MAP = {
-    1: {"name": "M1", "pwm": M1_PWM, "dir": M1_DIR, "enc": M1_ENC},
-    2: {"name": "M2", "pwm": M2_PWM, "dir": M2_DIR, "enc": M2_ENC},
-    3: {"name": "M3", "pwm": M3_PWM, "dir": M3_DIR, "enc": M3_ENC},
-    4: {"name": "M4", "pwm": M4_PWM, "dir": M4_DIR, "enc": M4_ENC},
+    port: {
+        "name": cfg["name"],
+        "pwm": cfg["pins"]["pwm"],
+        "dir": cfg["pins"]["dir"],
+        "enc": cfg["pins"]["enc"],
+    }
+    for port, cfg in PORT_MAP.items()
 }
 
-# Which ports are used by the drivetrain abstraction
-DRIVE_MOTOR_PORTS = (1, 2)
 
-# Which ports should be exposed to BLE motor scan / state
+# ============================================================
+# DRIVE TRAIN CONFIG
+# ============================================================
+
+# Which actuator ports are used for drive motion.
+DRIVE_MOTOR_PORTS = (1, 2)
 ACTIVE_MOTOR_PORTS = (1, 2, 3, 4)
 
-# Motor scan settings
-MOTOR_SCAN_POWER = 25
-MOTOR_SCAN_PULSE_MS = 250
-MOTOR_SCAN_PERIOD_MS = 1500
-MOTOR_FEEDBACK_PERIOD_MS = 200
+LEFT_PORT = 1
+RIGHT_PORT = 2
 
-# ============================================================
-# MOTOR SETTINGS
-# ============================================================
+# Legacy aliases still used by current code.
+LEFT_PWM = MOTOR_PORT_MAP[LEFT_PORT]["pwm"]
+LEFT_DIR = MOTOR_PORT_MAP[LEFT_PORT]["dir"]
+LEFT_ENC = MOTOR_PORT_MAP[LEFT_PORT]["enc"]
 
-MOTOR_PWM_FREQ_HZ = 20000
-MOTOR_MAX_DUTY_U16 = 40000
-
-# Used by motor scanner if not overridden in main.py
-MOTOR_SCAN_POWER = 25
-MOTOR_SCAN_PULSE_MS = 250
-MOTOR_SCAN_PERIOD_MS = 1500
-MOTOR_FEEDBACK_PERIOD_MS = 200
+RIGHT_PWM = MOTOR_PORT_MAP[RIGHT_PORT]["pwm"]
+RIGHT_DIR = MOTOR_PORT_MAP[RIGHT_PORT]["dir"]
+RIGHT_ENC = MOTOR_PORT_MAP[RIGHT_PORT]["enc"]
 
 
 # ============================================================
-# SERVO
+# SERVO CONFIG
 # ============================================================
 
-STEER_SERVO_GPIO = 18
-
+# Shared servo timing defaults.
 SERVO_FREQ_HZ = 50
 SERVO_MIN_US = 500
 SERVO_MAX_US = 2500
 SERVO_CENTER_DEG = 90
+
+# Steering is a ROLE bound to a port, not a dedicated pin.
+STEER_SERVO_PORT = 1
+
+# Backward-compatible servo map for generic servo registration.
+SERVO_PORT_MAP = {
+    port: {
+        "name": "{}_SERVO".format(cfg["name"]),
+        "gpio": cfg["pins"]["pwm"],
+        "freq_hz": SERVO_FREQ_HZ,
+        "min_us": SERVO_MIN_US,
+        "max_us": SERVO_MAX_US,
+        "center_deg": SERVO_CENTER_DEG,
+        "role": "steering" if port == STEER_SERVO_PORT else "",
+    }
+    for port, cfg in PORT_MAP.items()
+}
+
+# Legacy compatibility only.
+# Do not use this for new code. It points to the steering port PWM pin.
+STEER_SERVO_GPIO = SERVO_PORT_MAP[STEER_SERVO_PORT]["gpio"]
 
 
 # ============================================================
@@ -144,7 +150,6 @@ TCA_ADDR = 0x70
 
 OLED_ADDR = 0x3C
 OLED_CHANNEL = 0
-
 OLED_WIDTH = 128
 OLED_HEIGHT = 64
 
@@ -186,3 +191,16 @@ SENSOR_PORT_MODES = {
     5: "auto",
     6: "auto",
 }
+
+
+# ============================================================
+# MOTOR / TELEMETRY SETTINGS
+# ============================================================
+
+MOTOR_PWM_FREQ_HZ = 20000
+MOTOR_MAX_DUTY_U16 = 40000
+
+MOTOR_SCAN_POWER = 25
+MOTOR_SCAN_PULSE_MS = 250
+MOTOR_SCAN_PERIOD_MS = 1500
+MOTOR_FEEDBACK_PERIOD_MS = 200

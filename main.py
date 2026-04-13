@@ -1212,7 +1212,6 @@ async def main():
         oled = None
 
     _boot_oled(api, "ZebraBot", "Starting BLE", "")
-
     try:
         teleop = BleTeleop(
             drive=runtime_drive,
@@ -1228,11 +1227,11 @@ async def main():
         info("BOOT: BLE teleop initialized")
         state("BOOT", "ble_ok")
     except Exception as e:
+        teleop = None
         error("BLE_INIT", e)
         _boot_oled(api, "ZebraBot", "BLE init fail", str(type(e).__name__))
-        raise
-
-    _boot_oled(api, "ZebraBot", "Starting sensors", "")
+        warn("BOOT: continuing without BLE")
+        state("BOOT", "ble_failed")
 
     try:
         notify_fn = teleop.notify_line if teleop is not None else None
