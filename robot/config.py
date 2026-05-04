@@ -204,3 +204,11 @@ MOTOR_SCAN_POWER = 25
 MOTOR_SCAN_PULSE_MS = 250
 MOTOR_SCAN_PERIOD_MS = 1500
 MOTOR_FEEDBACK_PERIOD_MS = 200
+
+# ============================================================
+# BUTTON IO Settings
+# ============================================================
+
+BUTTON0_IO  = 15
+BUTTON0_IO  = 12
+PULLDOWN = TRUE

@@ -13,6 +13,7 @@ from robot.tca9548a import TCA9548A
 from robot.sensor_hub import SensorHub
 from robot.motor_feedback import MotorFeedback
 from robot.motor_scan import MotorScanner
+from robot.button import ButtonManager
 from robot.debug_io import (
     info,
     warn,
@@ -78,6 +79,15 @@ MOTOR_SCAN_POWER = _cfg("MOTOR_SCAN_POWER", 25)
 MOTOR_SCAN_PULSE_MS = _cfg("MOTOR_SCAN_PULSE_MS", 250)
 MOTOR_SCAN_PERIOD_MS = _cfg("MOTOR_SCAN_PERIOD_MS", 1500)
 MOTOR_FEEDBACK_PERIOD_MS = _cfg("MOTOR_FEEDBACK_PERIOD_MS", 200)
+
+BUTTON_MAP = _cfg("BUTTON_MAP", {
+    1: {"name": "B1", "gpio": 15, "pull": "down", "active_low": False},
+    2: {"name": "B2", "gpio": 12, "pull": "down", "active_low": False},
+})
+BUTTON_DEBOUNCE_MS = _cfg("BUTTON_DEBOUNCE_MS", 35)
+BUTTON_SCAN_PERIOD_MS = _cfg("BUTTON_SCAN_PERIOD_MS", 10)
+BUTTON_DEFAULT_PULL = _cfg("BUTTON_DEFAULT_PULL", "down")
+BUTTON_DEFAULT_ACTIVE_LOW = _cfg("BUTTON_DEFAULT_ACTIVE_LOW", False)
 
 # Optional future-facing config. Falls back cleanly to the legacy dedicated steer servo.
 SERVO_PORT_MAP = _cfg("SERVO_PORT_MAP", None)
@@ -173,6 +183,7 @@ class RobotAPI:
             "steering": {},
             "imu": {},
             "sensors": {},
+            "buttons": {},
             "services": {},
             "user": {"running": False, "last_error": None},
         }
@@ -199,6 +210,18 @@ class RobotAPI:
 
     def get_services(self):
         return self.status.get("services", {})
+
+    def get_button_status(self):
+        return self.status.get("buttons", {})
+
+    def get_button_snapshot(self):
+        return self.status.get("buttons", {})
+
+    def button(self, button_id=1):
+        manager = self.handles.get("button_manager")
+        if manager is None:
+            return _ZBotButton(None, button_id)
+        return _ZBotButton(self, button_id)
 
     def mark_user_display(self, hold_ms=2500):
         try:
@@ -448,6 +471,58 @@ class RobotAPI:
         return _ZBotServo(self, port)
 
 
+class _ZBotButton:
+    def __init__(self, api, button_id=1):
+        self.api = api
+        self.button_id = int(button_id)
+
+    def _button(self):
+        if self.api is None:
+            return None
+        manager = self.api.get_handle("button_manager")
+        if manager is None:
+            return None
+        return manager.button(self.button_id)
+
+    def read(self):
+        button = self._button()
+        return False if button is None else button.read()
+
+    def value(self):
+        button = self._button()
+        return 0 if button is None else button.value()
+
+    def pressed(self):
+        button = self._button()
+        return False if button is None else button.pressed()
+
+    def released(self):
+        button = self._button()
+        return True if button is None else button.released()
+
+    def was_pressed(self):
+        button = self._button()
+        return False if button is None else button.was_pressed()
+
+    def was_released(self):
+        button = self._button()
+        return False if button is None else button.was_released()
+
+    def presses(self, reset=False):
+        button = self._button()
+        return 0 if button is None else button.presses(reset=reset)
+
+    def releases(self, reset=False):
+        button = self._button()
+        return 0 if button is None else button.releases(reset=reset)
+
+    def snapshot(self):
+        button = self._button()
+        if button is None:
+            return {"id": self.button_id, "available": False, "pressed": False}
+        return button.snapshot()
+
+
 class _ZBotSensor:
     def __init__(self, api, port):
         self.api = api
@@ -589,6 +664,7 @@ class ZBot:
         self.api = api
         self._motor_wrappers = {}
         self._servo_wrappers = {}
+        self._button_wrappers = {}
 
     def bind(self, api):
         self.api = api
@@ -621,6 +697,19 @@ class ZBot:
         if self.api is None:
             return False
         return self.api.notify(str(text))
+
+    def button(self, button_id=1):
+        key = int(button_id)
+        if self.api is None:
+            return _ZBotButton(None, button_id)
+
+        if key not in self._button_wrappers:
+            self._button_wrappers[key] = _ZBotButton(self.api, button_id)
+
+        return self._button_wrappers[key]
+
+    def buttons(self, button_id=1):
+        return self.button(button_id)
 
     def servo(self, port=1):
         key = int(port)
@@ -663,6 +752,11 @@ class ZBot:
         if self.api is None:
             return {}
         return self.api.get_sensor_snapshot()
+
+    def button_status(self):
+        if self.api is None:
+            return {}
+        return self.api.get_button_status()
 
     def imu(self):
         if self.api is None:
@@ -1025,6 +1119,7 @@ async def main():
     servos = {}
     motor_feedback = None
     motor_scanner = None
+    button_manager = None
 
     api = RobotAPI()
     API = api
@@ -1135,6 +1230,26 @@ async def main():
         api.register_handle("runtime_drive", runtime_drive)
     except Exception as e:
         error("RUNTIME_DRIVE_INIT", e)
+
+    try:
+        button_manager = ButtonManager(
+            api=api,
+            button_map=BUTTON_MAP,
+            debounce_ms=BUTTON_DEBOUNCE_MS,
+            scan_period_ms=BUTTON_SCAN_PERIOD_MS,
+            default_pull=BUTTON_DEFAULT_PULL,
+            default_active_low=BUTTON_DEFAULT_ACTIVE_LOW,
+        )
+        button_manager.start()
+        api.register_handle("button_manager", button_manager)
+        info("BOOT: buttons initialized")
+        diag("BUTTONS {}".format(button_manager.snapshot()))
+        state("BOOT", "buttons_ok")
+    except Exception as e:
+        button_manager = None
+        error("BUTTON_INIT", e)
+        warn("BOOT: continuing without buttons")
+        state("BOOT", "buttons_failed")
 
     try:
         base_i2c = I2C(
@@ -1336,6 +1451,14 @@ async def main():
             error("MOTOR_FB_TASK", e)
     else:
         warn("BOOT: motor scan tasks skipped")
+
+    if button_manager is not None:
+        try:
+            api.register_task("buttons", asyncio.create_task(button_manager.task()))
+            info("BOOT: Button task started")
+            state("TASK", "buttons_started")
+        except Exception as e:
+            error("BUTTON_TASK", e)
 
     try:
         api.register_task("api_housekeeping", asyncio.create_task(_api_housekeeping_task(api)))
