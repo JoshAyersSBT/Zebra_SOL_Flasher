@@ -4,6 +4,8 @@ from machine import I2C, Pin
 
 import robot.config as robot_config
 
+MAIN_BUILD = "lazy-actuator-claim-v3-full"
+
 from robot.motors import Motor
 from robot.servo import Servo
 from robot.ble_teleop import BleTeleop
@@ -89,7 +91,6 @@ BUTTON_SCAN_PERIOD_MS = _cfg("BUTTON_SCAN_PERIOD_MS", 10)
 BUTTON_DEFAULT_PULL = _cfg("BUTTON_DEFAULT_PULL", "down")
 BUTTON_DEFAULT_ACTIVE_LOW = _cfg("BUTTON_DEFAULT_ACTIVE_LOW", False)
 
-# Optional future-facing config. Falls back cleanly to the legacy dedicated steer servo.
 SERVO_PORT_MAP = _cfg("SERVO_PORT_MAP", None)
 STEER_SERVO_PORT = _cfg("STEER_SERVO_PORT", 1)
 
@@ -117,22 +118,6 @@ def _clamp(x, lo, hi):
 
 
 class RuntimeDriveBridge:
-    """
-    Generic boot/runtime drive bridge used by BLE teleop and legacy calls.
-
-    This intentionally does not define the student's drive model.
-    It only provides a minimal motion bridge so:
-      - BLE teleop can command the robot
-      - legacy helpers still have a neutral fallback
-
-    Semantics:
-      throttle: -100..100
-      turn:     -100..100
-
-    Behavior:
-      - all propulsion motors receive the same signed throttle
-      - steering servo is mapped around center using turn
-    """
     def __init__(self, api, propulsion_ports=None, steer_center_deg=DEFAULT_STEER_CENTER_DEG, steer_range_deg=DEFAULT_STEER_RANGE_DEG):
         self.api = api
         ports = propulsion_ports if propulsion_ports is not None else ACTIVE_MOTOR_PORTS
@@ -140,7 +125,7 @@ class RuntimeDriveBridge:
         self.steer_center_deg = int(steer_center_deg)
         self.steer_range_deg = int(steer_range_deg)
 
-    def drive(self, throttle: int, turn: int):
+    def drive(self, throttle, turn):
         throttle = _clamp(int(throttle), -100, 100)
         turn = _clamp(int(turn), -100, 100)
 
@@ -165,15 +150,6 @@ class RuntimeDriveBridge:
 
 
 class RobotAPI:
-    """
-    Shared low-level runtime API exposed to user programs and internal services.
-
-    This API intentionally avoids hard-coding a student-facing drive model.
-    User code should compose motion behavior in robot modules such as:
-      - robot.ackermann
-      - robot.differential
-    """
-
     def __init__(self):
         self.status = {
             "boot": {"state": "init", "safe_mode": False},
@@ -185,11 +161,23 @@ class RobotAPI:
             "sensors": {},
             "buttons": {},
             "services": {},
-            "user": {"running": False, "last_error": None},
+            "user": {
+                "loaded": False,
+                "running": False,
+                "last_error": None,
+                "last_start_ms": None,
+                "last_stop_ms": None,
+            },
         }
         self.handles = {}
         self.tasks = {}
+
+        # Display ownership model:
+        # User code publishes desired display lines here. The OLED status task is
+        # the only task that writes to the physical display after boot.
         self._oled_user_hold_until = 0
+        self._oled_user_lines = None
+        self._oled_user_seq = 0
 
     def register_handle(self, name, value):
         self.handles[name] = value
@@ -265,14 +253,106 @@ class RobotAPI:
             mag = 100
         return (mag * MOTOR_MAX_DUTY_U16) // 100
 
-    def set_motor(self, port, power):
+    def _claim_motor_port(self, port):
+        port = int(port)
+
         motors = self.handles.get("motors", {})
-        motor = motors.get(port)
-        if motor is None:
+        if port in motors:
+            return motors[port]
+
+        servos = self.handles.get("servos", {})
+        if port in servos:
+            raise RuntimeError("actuator port {} already claimed as servo".format(port))
+
+        motor_map = self.handles.get("motor_port_map", {})
+        cfg = motor_map.get(port)
+        if cfg is None:
             raise ValueError("unknown motor port {}".format(port))
 
-        power = int(power)
+        if "fwd" in cfg and "rev" in cfg:
+            motor = Motor(
+                cfg["pwm"],
+                cfg["fwd"],
+                cfg["rev"],
+                pwm_freq_hz=MOTOR_PWM_FREQ_HZ,
+                invert_pwm=bool(cfg.get("invert_pwm", False)),
+            )
+        else:
+            motor = Motor(
+                cfg["pwm"],
+                cfg["dir"],
+                pwm_freq_hz=MOTOR_PWM_FREQ_HZ,
+            )
 
+        motors[port] = motor
+        self.handles["motors"] = motors
+
+        self.status["motors"][port] = {
+            "power": 0,
+            "duty_u16": 0,
+            "name": cfg.get("name", "M{}".format(port)),
+            "enc": cfg.get("enc"),
+            "ts_ms": time.ticks_ms(),
+        }
+
+        diag("ACTUATOR_PORT {} claimed as motor".format(port))
+        return motor
+
+    def _claim_servo_port(self, port):
+        port = int(port)
+
+        servos = self.handles.get("servos", {})
+        if port in servos:
+            return servos[port]
+
+        motors = self.handles.get("motors", {})
+        if port in motors:
+            raise RuntimeError("actuator port {} already claimed as motor".format(port))
+
+        servo_map = self.handles.get("servo_port_map", {})
+        cfg = servo_map.get(port)
+
+        if cfg is None:
+            motor_map = self.handles.get("motor_port_map", {})
+            motor_cfg = motor_map.get(port)
+            if motor_cfg is None:
+                raise ValueError("unknown servo port {}".format(port))
+            cfg = {
+                "name": "{}_SERVO".format(motor_cfg.get("name", "P{}".format(port))),
+                "gpio": motor_cfg["pwm"],
+                "freq_hz": SERVO_FREQ_HZ,
+                "min_us": SERVO_MIN_US,
+                "max_us": SERVO_MAX_US,
+                "center_deg": SERVO_CENTER_DEG,
+                "role": "",
+            }
+            servo_map[port] = cfg
+            self.handles["servo_port_map"] = servo_map
+
+        servo = Servo(
+            int(cfg["gpio"]),
+            freq_hz=int(cfg.get("freq_hz", SERVO_FREQ_HZ)),
+            min_us=int(cfg.get("min_us", SERVO_MIN_US)),
+            max_us=int(cfg.get("max_us", SERVO_MAX_US)),
+        )
+
+        servos[port] = servo
+        self.handles["servos"] = servos
+
+        self.status["servos"][port] = {
+            "angle": None,
+            "ts_ms": time.ticks_ms(),
+            "name": cfg.get("name", "S{}".format(port)),
+        }
+
+        diag("ACTUATOR_PORT {} claimed as servo gpio={}".format(port, cfg.get("gpio")))
+        return servo
+
+    def set_motor(self, port, power):
+        port = int(port)
+        motor = self._claim_motor_port(port)
+
+        power = int(power)
         if hasattr(motor, "set_power"):
             motor.set_power(power)
         else:
@@ -282,9 +362,7 @@ class RobotAPI:
                 else:
                     motor.set(True, 0)
             else:
-                forward = power > 0
-                duty_u16 = self._power_to_duty(power)
-                motor.set(forward, duty_u16)
+                motor.set(power > 0, self._power_to_duty(power))
 
         self.status["motors"][port] = {
             "power": power,
@@ -295,10 +373,8 @@ class RobotAPI:
         return self.status["motors"][port]
 
     def stop_motor(self, port):
-        motors = self.handles.get("motors", {})
-        motor = motors.get(port)
-        if motor is None:
-            raise ValueError("unknown motor port {}".format(port))
+        port = int(port)
+        motor = self._claim_motor_port(port)
 
         if hasattr(motor, "stop"):
             motor.stop()
@@ -314,20 +390,31 @@ class RobotAPI:
         return self.status["motors"][port]
 
     def stop_all(self):
-        motors = self.handles.get("motors", {})
-        for port in motors:
+        for port in self.handles.get("motors", {}):
             try:
                 self.stop_motor(port)
             except Exception as e:
                 error("STOP_MOTOR_{}".format(port), e)
 
     def set_servo(self, port, angle):
-        servos = self.handles.get("servos", {})
-        servo = servos.get(int(port))
-        if servo is None:
-            raise ValueError("unknown servo port {}".format(port))
+        port = int(port)
+        servo = self._claim_servo_port(port)
 
         angle = int(angle)
+        if angle < 0:
+            angle = 0
+        if angle > 180:
+            angle = 180
+
+        # Servo commands are absolute positions. Avoid re-writing the same
+        # angle repeatedly because some hobby servos twitch when refreshed
+        # during noisy motor activity.
+        last = self.status.get("servos", {}).get(port, {})
+        try:
+            if int(last.get("angle")) == angle:
+                return last
+        except Exception:
+            pass
 
         if hasattr(servo, "write_angle"):
             servo.write_angle(angle)
@@ -336,26 +423,33 @@ class RobotAPI:
         else:
             raise AttributeError("servo object has no write_angle/angle")
 
-        cfg = self.get_servo_map().get(int(port), {})
+        cfg = self.get_servo_map().get(port, {})
         item = {
             "angle": angle,
             "ts_ms": time.ticks_ms(),
             "name": cfg.get("name", "S{}".format(port)),
         }
-        self.status["servos"][int(port)] = item
+        self.status["servos"][port] = item
         return item
 
     def center_servo(self, port):
         cfg = self.get_servo_map().get(int(port), {})
-        center_deg = int(cfg.get("center_deg", 90))
-        return self.set_servo(int(port), center_deg)
+        return self.set_servo(int(port), int(cfg.get("center_deg", 90)))
 
     def set_steering(self, angle):
         steer = self.handles.get("steer")
         if steer is None:
-            raise RuntimeError("steering unavailable")
+            steer_port = int(self.handles.get("steer_port", STEER_SERVO_PORT))
+            steer = self._claim_servo_port(steer_port)
+            self.register_handle("steer", steer)
+            self.register_handle("steer_port", steer_port)
 
         angle = int(angle)
+        if angle < 0:
+            angle = 0
+        if angle > 180:
+            angle = 180
+
         if hasattr(steer, "write_angle"):
             steer.write_angle(angle)
         elif hasattr(steer, "angle"):
@@ -363,10 +457,7 @@ class RobotAPI:
         else:
             raise AttributeError("steering object has no write_angle/angle")
 
-        self.status["steering"] = {
-            "angle": angle,
-            "ts_ms": time.ticks_ms(),
-        }
+        self.status["steering"] = {"angle": angle, "ts_ms": time.ticks_ms()}
 
         steer_port = self.handles.get("steer_port", None)
         if steer_port is not None:
@@ -378,14 +469,10 @@ class RobotAPI:
                 }
             except Exception:
                 pass
-
         return self.status["steering"]
 
     def publish_sensor(self, name, value, meta=None):
-        item = {
-            "value": value,
-            "ts_ms": time.ticks_ms(),
-        }
+        item = {"value": value, "ts_ms": time.ticks_ms()}
         if meta is not None:
             item["meta"] = meta
         self.status["sensors"][name] = item
@@ -404,7 +491,6 @@ class RobotAPI:
         imu = self.handles.get("imu")
         if imu is None:
             return None
-
         try:
             if hasattr(imu, "read_scaled"):
                 reading = imu.read_scaled()
@@ -412,17 +498,10 @@ class RobotAPI:
                 reading = imu.read()
             else:
                 raise AttributeError("imu object has no read_scaled/read")
-
-            self.status["imu"] = {
-                "value": reading,
-                "ts_ms": time.ticks_ms(),
-            }
+            self.status["imu"] = {"value": reading, "ts_ms": time.ticks_ms()}
             return self.status["imu"]
         except Exception as e:
-            self.status["imu"] = {
-                "error": repr(e),
-                "ts_ms": time.ticks_ms(),
-            }
+            self.status["imu"] = {"error": repr(e), "ts_ms": time.ticks_ms()}
             return None
 
     def notify(self, msg):
@@ -436,18 +515,18 @@ class RobotAPI:
         return False
 
     def show_lines(self, *lines):
-        oled = self.handles.get("oled")
-        if oled is None:
-            return False
         try:
+            clean = tuple(str(x) for x in lines if str(x) != "")
+            if not clean:
+                return False
+            self._oled_user_lines = clean
+            self._oled_user_seq += 1
             self.mark_user_display(hold_ms=5000)
-            oled.show_lines(*lines)
             return True
         except Exception as e:
-            error("API_OLED", e)
+            error("API_OLED_BUFFER", e)
             return False
 
-    # Compatibility shims so old student code fails less harshly.
     def drive(self, throttle, turn=0):
         bridge = self.handles.get("runtime_drive")
         if bridge is None:
@@ -531,47 +610,29 @@ class _ZBotSensor:
     def _find_snapshot_value(self):
         if self.api is None:
             return None
-
         sensors = self.api.get_sensor_snapshot()
-
-        key = "tof_port_{}".format(self.port)
-        item = sensors.get(key)
-        if isinstance(item, dict):
-            value = item.get("value")
-            if isinstance(value, (int, float)):
-                return int(value)
-
-        fallback_keys = (
+        keys = (
+            "tof_port_{}".format(self.port),
             "port{}_tof".format(self.port),
             "tof_{}".format(self.port),
             "sensor_port_{}".format(self.port),
         )
-
-        for key in fallback_keys:
+        for key in keys:
             item = sensors.get(key)
             if isinstance(item, dict):
                 value = item.get("value")
                 if isinstance(value, (int, float)):
                     return int(value)
-
         for key, item in sensors.items():
             if not isinstance(item, dict):
                 continue
-
             value = item.get("value")
             if not isinstance(value, (int, float)):
                 continue
-
-            meta = item.get("meta", {})
             key_s = str(key).lower()
-            meta_s = str(meta).lower()
-
-            if "tof" in key_s and str(self.port) in key_s:
+            meta_s = str(item.get("meta", {})).lower()
+            if ("tof" in key_s and str(self.port) in key_s) or ("tof" in meta_s and str(self.port) in meta_s):
                 return int(value)
-
-            if "tof" in meta_s and str(self.port) in meta_s:
-                return int(value)
-
         return None
 
     def read(self):
@@ -615,10 +676,7 @@ class _ZBotMotor:
         try:
             if "student_motors" not in self.api.status:
                 self.api.status["student_motors"] = {}
-            self.api.status["student_motors"][self.port] = {
-                "type": self.motor_type,
-                "ts_ms": time.ticks_ms(),
-            }
+            self.api.status["student_motors"][self.port] = {"type": self.motor_type, "ts_ms": time.ticks_ms()}
         except Exception:
             pass
 
@@ -654,12 +712,6 @@ class _ZBotMotor:
 
 
 class ZBot:
-    """
-    Student-facing neutral wrapper.
-
-    This wrapper exposes primitives only. Drive-model decisions belong in
-    user modules (robot.ackermann, robot.differential, etc).
-    """
     def __init__(self, api=None):
         self.api = api
         self._motor_wrappers = {}
@@ -702,10 +754,8 @@ class ZBot:
         key = int(button_id)
         if self.api is None:
             return _ZBotButton(None, button_id)
-
         if key not in self._button_wrappers:
             self._button_wrappers[key] = _ZBotButton(self.api, button_id)
-
         return self._button_wrappers[key]
 
     def buttons(self, button_id=1):
@@ -715,20 +765,16 @@ class ZBot:
         key = int(port)
         if self.api is None:
             return _ZBotServo(None, port)
-
         if key not in self._servo_wrappers:
             self._servo_wrappers[key] = _ZBotServo(self.api, port)
-
         return self._servo_wrappers[key]
 
     def motor(self, port, motor_type="DC"):
         key = (int(port), str(motor_type))
         if self.api is None:
             return _ZBotMotor(None, port, motor_type)
-
         if key not in self._motor_wrappers:
             self._motor_wrappers[key] = _ZBotMotor(self.api, port, motor_type)
-
         return self._motor_wrappers[key]
 
     def motors(self, port, motor_type="DC"):
@@ -740,45 +786,29 @@ class ZBot:
         return _ZBotSensor(self.api, port)
 
     def tof(self, port):
-        s = self.sensor(port)
-        return s.read()
+        return self.sensor(port).read()
 
     def status(self):
-        if self.api is None:
-            return {}
-        return self.api.get_status()
+        return {} if self.api is None else self.api.get_status()
 
     def sensors(self):
-        if self.api is None:
-            return {}
-        return self.api.get_sensor_snapshot()
+        return {} if self.api is None else self.api.get_sensor_snapshot()
 
     def button_status(self):
-        if self.api is None:
-            return {}
-        return self.api.get_button_status()
+        return {} if self.api is None else self.api.get_button_status()
 
     def imu(self):
-        if self.api is None:
-            return {}
-        return self.api.get_imu()
+        return {} if self.api is None else self.api.get_imu()
 
     def motor_status(self):
-        if self.api is None:
-            return {}
-        return self.api.get_motor_status()
+        return {} if self.api is None else self.api.get_motor_status()
 
     def motor_feedback(self):
-        if self.api is None:
-            return {}
-        return self.api.get_motor_feedback()
+        return {} if self.api is None else self.api.get_motor_feedback()
 
     def servo_status(self):
-        if self.api is None:
-            return {}
-        return self.api.get_servo_status()
+        return {} if self.api is None else self.api.get_servo_status()
 
-    # Backward-compatible motion shims. They use the neutral runtime bridge.
     def drive(self, throttle, turn=0):
         if self.api is None:
             return False
@@ -811,13 +841,10 @@ def _boot_oled(api, line1, line2="", line3=""):
     try:
         if api is None:
             return
-
         if api.status.get("boot", {}).get("state") == "complete":
             return
-
         if api.user_display_active():
             return
-
         oled = api.get_handle("oled")
         if oled is not None and getattr(oled, "available", False):
             oled.show_lines(line1, line2, line3)
@@ -828,8 +855,7 @@ def _boot_oled(api, line1, line2="", line3=""):
 def _format_tof_line(api):
     sensors = api.status.get("sensors", {})
     for port in range(1, 7):
-        key = "tof_port_{}".format(port)
-        item = sensors.get(key)
+        item = sensors.get("tof_port_{}".format(port))
         if isinstance(item, dict):
             value = item.get("value")
             if isinstance(value, (int, float)):
@@ -843,7 +869,9 @@ def _format_user_line(api):
         return "User ERR"
     if user.get("running"):
         return "User: running"
-    return "User: idle"
+    if user.get("loaded"):
+        return "User: loaded"
+    return "User: missing"
 
 
 def _format_ble_line(api):
@@ -860,7 +888,6 @@ def _format_ble_line(api):
 
 def _sensor_port_line(api, port):
     sensors = api.status.get("sensors", {})
-
     candidates = [
         "tof_port_{}".format(port),
         "port{}_tof".format(port),
@@ -869,27 +896,20 @@ def _sensor_port_line(api, port):
         "color_port_{}".format(port),
         "port{}_color".format(port),
     ]
-
     for key in candidates:
         item = sensors.get(key)
         if not isinstance(item, dict):
             continue
-
         value = item.get("value")
         meta = item.get("meta", {})
         key_l = key.lower()
         meta_l = str(meta).lower()
-
         if isinstance(value, (int, float)) and ("tof" in key_l or "tof" in meta_l):
             return "P{} TOF {}mm".format(port, int(value))
-
-        if isinstance(value, dict):
-            if "r" in value and "g" in value and "b" in value:
-                return "P{} RGB".format(port)
-
+        if isinstance(value, dict) and "r" in value and "g" in value and "b" in value:
+            return "P{} RGB".format(port)
         if isinstance(value, (int, float)):
             return "P{} {}".format(port, int(value))
-
         if value is not None:
             return "P{} {}".format(port, str(value)[:10])
 
@@ -900,27 +920,21 @@ def _sensor_port_line(api, port):
         meta_l = str(item.get("meta", {})).lower()
         if str(port) not in key_l and str(port) not in meta_l:
             continue
-
         value = item.get("value")
         if isinstance(value, (int, float)) and ("tof" in key_l or "tof" in meta_l):
             return "P{} TOF {}mm".format(port, int(value))
         if value is not None:
             return "P{} {}".format(port, str(value)[:10])
 
-    mode = None
     try:
         mode = SENSOR_PORT_MODES.get(port)
     except Exception:
         mode = None
-
-    if mode:
-        return "P{} {}".format(port, str(mode))
-    return "P{} empty".format(port)
+    return "P{} {}".format(port, str(mode)) if mode else "P{} empty".format(port)
 
 
 def _sensor_overview_pages(api):
     pages = []
-
     user = api.status.get("user", {})
     if user.get("last_error"):
         err_name = str(user.get("last_error"))[:18]
@@ -930,9 +944,8 @@ def _sensor_overview_pages(api):
 
     ports = [1, 2, 3, 4, 5, 6]
     for i in range(0, len(ports), 3):
-        chunk = ports[i:i + 3]
         lines = ["Sensors"]
-        for port in chunk:
+        for port in ports[i:i + 3]:
             lines.append(_sensor_port_line(api, port))
         pages.append(tuple(lines))
 
@@ -941,9 +954,7 @@ def _sensor_overview_pages(api):
         if "error" in imu:
             pages.append(("IMU", "error", str(imu.get("error"))[:18]))
         else:
-            value = imu.get("value")
-            pages.append(("IMU", str(value)[:20], ""))
-
+            pages.append(("IMU", str(imu.get("value"))[:20], ""))
     return pages
 
 
@@ -955,19 +966,16 @@ async def _api_housekeeping_task(api):
                 api.status["motor_feedback"] = motor_feedback.snapshot()
         except Exception:
             pass
-
         try:
             sensor_hub = api.get_handle("sensor_hub")
             if sensor_hub is not None and hasattr(sensor_hub, "snapshot"):
                 api.status["sensors"] = sensor_hub.snapshot()
         except Exception:
             pass
-
         try:
             api.refresh_imu_snapshot()
         except Exception:
             pass
-
         await asyncio.sleep_ms(100)
 
 
@@ -985,37 +993,32 @@ async def _oled_status_task(api):
                 continue
 
             if api.user_display_active():
-                await asyncio.sleep_ms(200)
+                lines = api._oled_user_lines or ("",)
+                if lines != last_lines:
+                    oled.show_lines(*lines)
+                    last_lines = lines
+                await asyncio.sleep_ms(100)
                 continue
 
             user = api.status.get("user", {})
-            fallback_mode = (not user.get("running")) or bool(user.get("last_error"))
+            user_loaded = bool(user.get("loaded"))
+            user_error = bool(user.get("last_error"))
 
-            if user.get("running") and not user.get("last_error"):
+            # After boot, do not cycle system/sensor pages while a valid user_main
+            # is loaded and healthy. User code owns the display through zbot.display().
+            if user_loaded and not user_error:
                 await asyncio.sleep_ms(250)
                 continue
 
-            if fallback_mode:
-                pages = _sensor_overview_pages(api)
-                now = time.ticks_ms()
-                if not pages:
-                    lines = ("ZebraBot", "No sensors", "")
-                else:
-                    if (
-                        last_page_ms == 0
-                        or time.ticks_diff(now, last_page_ms) >= page_period_ms
-                    ):
-                        page_idx = (page_idx + 1) % len(pages)
-                        last_page_ms = now
-                    lines = pages[page_idx]
+            pages = _sensor_overview_pages(api)
+            now = time.ticks_ms()
+            if not pages:
+                lines = ("ZebraBot", "No sensors", "")
             else:
-                line1 = "ZebraBot Ready" if api.status["system"].get("ready") else "ZebraBot Boot"
-                line2 = _format_ble_line(api)
-                line3 = _format_user_line(api)
-                line4 = _format_tof_line(api)
-                lines = (line1, line2, line3, line4)
-                page_idx = 0
-                last_page_ms = 0
+                if last_page_ms == 0 or time.ticks_diff(now, last_page_ms) >= page_period_ms:
+                    page_idx = (page_idx + 1) % len(pages)
+                    last_page_ms = now
+                lines = pages[page_idx]
 
             if lines != last_lines:
                 oled.show_lines(*lines)
@@ -1023,7 +1026,6 @@ async def _oled_status_task(api):
 
         except Exception as e:
             error("OLED_STATUS_TASK", e)
-
         await asyncio.sleep_ms(250)
 
 
@@ -1037,8 +1039,8 @@ async def _run_user_program(api):
         import user_main
     except Exception as e:
         error("USER_IMPORT", e)
+        api.status["user"]["loaded"] = False
         api.status["user"]["last_error"] = repr(e)
-
         teleop = api.get_handle("teleop")
         if teleop is not None:
             try:
@@ -1050,8 +1052,8 @@ async def _run_user_program(api):
     user_fn = getattr(user_main, "main", None)
     if user_fn is None:
         warn("USER: user_main.main missing")
+        api.status["user"]["loaded"] = False
         api.status["user"]["last_error"] = "user_main.main missing"
-
         teleop = api.get_handle("teleop")
         if teleop is not None:
             try:
@@ -1060,8 +1062,10 @@ async def _run_user_program(api):
                 pass
         return
 
+    api.status["user"]["loaded"] = True
     api.status["user"]["running"] = True
     api.status["user"]["last_error"] = None
+    api.status["user"]["last_start_ms"] = time.ticks_ms()
 
     teleop = api.get_handle("teleop")
     if teleop is not None:
@@ -1076,7 +1080,6 @@ async def _run_user_program(api):
             argc = user_fn.__code__.co_argcount
         except Exception:
             pass
-
         if argc == 0:
             await user_fn()
         else:
@@ -1085,7 +1088,6 @@ async def _run_user_program(api):
     except Exception as e:
         api.status["user"]["last_error"] = repr(e)
         error("USER_MAIN", e)
-
         if teleop is not None:
             try:
                 teleop.notify_error("USER_MAIN", e)
@@ -1094,7 +1096,7 @@ async def _run_user_program(api):
 
     finally:
         api.status["user"]["running"] = False
-
+        api.status["user"]["last_stop_ms"] = time.ticks_ms()
         if teleop is not None:
             try:
                 teleop.notify_line("INFO USER main stopped")
@@ -1103,8 +1105,7 @@ async def _run_user_program(api):
 
 
 async def main():
-    global API
-    global zbot
+    global API, zbot
 
     teleop = None
     sensor_hub = None
@@ -1129,100 +1130,57 @@ async def main():
     state("BOOT", "start")
     api.status["boot"]["state"] = "starting"
 
+    diag("MAIN_BUILD {}".format(MAIN_BUILD))
     try:
+        diag("CONFIG_BUILD {}".format(robot_config.CONFIG_BUILD))
+    except Exception:
+        diag("CONFIG_BUILD missing")
+
+    try:
+        # Register actuator/motor capabilities only. Ports are claimed lazily
+        # when user code calls zbot.motor(port), preventing PWM conflicts with servos.
+        api.register_handle("motors", motors)
+        api.register_handle("motor_port_map", dict(MOTOR_PORT_MAP))
+
         for port in sorted(MOTOR_PORT_MAP.keys()):
             cfg = MOTOR_PORT_MAP[port]
-            motors[port] = Motor(
-                cfg["pwm"],
-                cfg["dir"],
-                pwm_freq_hz=MOTOR_PWM_FREQ_HZ,
-            )
             diag(
-                "MOTOR_PORT {} {} pwm={} dir={} enc={}".format(
+                "ACTUATOR_PORT {} {} pwm={} fwd={} rev={} dir={} enc={}".format(
                     port,
-                    cfg.get("name", "M{}".format(port)),
+                    cfg.get("name", "P{}".format(port)),
                     cfg.get("pwm"),
+                    cfg.get("fwd"),
+                    cfg.get("rev"),
                     cfg.get("dir"),
                     cfg.get("enc"),
                 )
             )
-            api.status["motors"][port] = {
-                "power": 0,
-                "duty_u16": 0,
-                "name": cfg.get("name", "M{}".format(port)),
-                "enc": cfg.get("enc"),
-                "ts_ms": time.ticks_ms(),
-            }
 
-        api.register_handle("motors", motors)
-        api.register_handle("motor_port_map", dict(MOTOR_PORT_MAP))
-
-        info("BOOT: motors initialized")
+        diag("MOTOR_CAPABLE_PORTS {}".format(sorted(MOTOR_PORT_MAP.keys())))
+        info("BOOT: actuator motor map registered")
         diag("DRIVE LEFT PWM={} DIR={} ENC={}".format(LEFT_PWM, LEFT_DIR, LEFT_ENC))
         diag("DRIVE RIGHT PWM={} DIR={} ENC={}".format(RIGHT_PWM, RIGHT_DIR, RIGHT_ENC))
-        state("BOOT", "motors_ok")
-
+        state("BOOT", "motor_map_ok")
     except Exception as e:
-        error("MOTOR_INIT", e)
+        error("MOTOR_MAP_INIT", e)
         raise
 
     try:
-        for port in sorted(SERVO_PORT_MAP.keys()):
-            cfg = SERVO_PORT_MAP[port]
-            servos[port] = Servo(
-                int(cfg.get("gpio", STEER_SERVO_GPIO)),
-                freq_hz=int(cfg.get("freq_hz", SERVO_FREQ_HZ)),
-                min_us=int(cfg.get("min_us", SERVO_MIN_US)),
-                max_us=int(cfg.get("max_us", SERVO_MAX_US)),
-            )
-            api.status["servos"][port] = {
-                "angle": None,
-                "ts_ms": time.ticks_ms(),
-                "name": cfg.get("name", "S{}".format(port)),
-            }
-            diag(
-                "SERVO_PORT {} {} gpio={} freq={} min_us={} max_us={}".format(
-                    port,
-                    cfg.get("name", "S{}".format(port)),
-                    cfg.get("gpio", STEER_SERVO_GPIO),
-                    cfg.get("freq_hz", SERVO_FREQ_HZ),
-                    cfg.get("min_us", SERVO_MIN_US),
-                    cfg.get("max_us", SERVO_MAX_US),
-                )
-            )
-
+        # Register servo capabilities only. Ports are claimed lazily
+        # when user code calls zbot.servo(port), preventing PWM conflicts with motors.
         api.register_handle("servos", servos)
         api.register_handle("servo_port_map", dict(SERVO_PORT_MAP))
 
-        steer_port = None
-        for port, cfg in SERVO_PORT_MAP.items():
-            if str(cfg.get("role", "")).lower() == "steering":
-                steer_port = int(port)
-                break
-        if steer_port is None and servos:
-            steer_port = sorted(servos.keys())[0]
+        diag("SERVO_CAPABLE_PORTS {}".format(sorted(SERVO_PORT_MAP.keys())))
 
-        if steer_port is None:
-            raise RuntimeError("no servo ports available")
-
-        steer = servos[steer_port]
-        api.register_handle("steer", steer)
-        api.register_handle("steer_port", int(steer_port))
+        steer = None
+        api.register_handle("steer_port", int(STEER_SERVO_PORT))
         api.status["steering"] = {"angle": None, "ts_ms": time.ticks_ms()}
-        info("BOOT: servo(s) initialized")
-        state("BOOT", "servo_ok")
 
-        try:
-            api.center_servo(steer_port)
-            api.status["steering"] = {
-                "angle": int(SERVO_PORT_MAP.get(steer_port, {}).get("center_deg", SERVO_CENTER_DEG)),
-                "ts_ms": time.ticks_ms(),
-            }
-        except Exception as center_err:
-            error("SERVO_CENTER_INIT", center_err)
-
+        info("BOOT: servo map registered")
+        state("BOOT", "servo_map_ok")
     except Exception as e:
-        error("SERVO_INIT", e)
+        error("SERVO_MAP_INIT", e)
         raise
 
     try:
@@ -1232,14 +1190,7 @@ async def main():
         error("RUNTIME_DRIVE_INIT", e)
 
     try:
-        button_manager = ButtonManager(
-            api=api,
-            button_map=BUTTON_MAP,
-            debounce_ms=BUTTON_DEBOUNCE_MS,
-            scan_period_ms=BUTTON_SCAN_PERIOD_MS,
-            default_pull=BUTTON_DEFAULT_PULL,
-            default_active_low=BUTTON_DEFAULT_ACTIVE_LOW,
-        )
+        button_manager = ButtonManager(api=api, button_map=BUTTON_MAP, debounce_ms=BUTTON_DEBOUNCE_MS, scan_period_ms=BUTTON_SCAN_PERIOD_MS, default_pull=BUTTON_DEFAULT_PULL, default_active_low=BUTTON_DEFAULT_ACTIVE_LOW)
         button_manager.start()
         api.register_handle("button_manager", button_manager)
         info("BOOT: buttons initialized")
@@ -1252,47 +1203,24 @@ async def main():
         state("BOOT", "buttons_failed")
 
     try:
-        base_i2c = I2C(
-            TCA_I2C_ID,
-            sda=Pin(TCA_SDA_GPIO),
-            scl=Pin(TCA_SCL_GPIO),
-            freq=TCA_I2C_FREQ,
-        )
+        base_i2c = I2C(TCA_I2C_ID, sda=Pin(TCA_SDA_GPIO), scl=Pin(TCA_SCL_GPIO), freq=TCA_I2C_FREQ)
         mux = TCA9548A(base_i2c, addr=TCA_ADDR)
         api.register_handle("base_i2c", base_i2c)
         api.register_handle("mux", mux)
         info("BOOT: TCA9548A initialized")
-        diag(
-            "TCA BUS sda={} scl={} addr={}".format(
-                TCA_SDA_GPIO, TCA_SCL_GPIO, hex(TCA_ADDR)
-            )
-        )
+        diag("TCA BUS sda={} scl={} addr={}".format(TCA_SDA_GPIO, TCA_SCL_GPIO, hex(TCA_ADDR)))
         state("BOOT", "mux_ok")
-
         try:
             devices = base_i2c.scan()
-            api.status["services"]["i2c"] = {
-                "bus": TCA_I2C_ID,
-                "devices": devices,
-                "ts_ms": time.ticks_ms(),
-            }
+            api.status["services"]["i2c"] = {"bus": TCA_I2C_ID, "devices": devices, "ts_ms": time.ticks_ms()}
             diag("I2C_BASE {}".format(",".join(hex(d) for d in devices) if devices else "none"))
         except Exception as scan_err:
             error("I2C_SCAN", scan_err)
-
     except Exception as e:
         error("TCA_INIT", e)
 
     try:
-        imu = MPU6050(
-            i2c_id=TCA_I2C_ID,
-            sda_gpio=TCA_SDA_GPIO,
-            scl_gpio=TCA_SCL_GPIO,
-            freq=TCA_I2C_FREQ,
-            addr=MPU_ADDR,
-            mux=mux,
-            mux_channel=MPU_CHANNEL,
-        )
+        imu = MPU6050(i2c_id=TCA_I2C_ID, sda_gpio=TCA_SDA_GPIO, scl_gpio=TCA_SCL_GPIO, freq=TCA_I2C_FREQ, addr=MPU_ADDR, mux=mux, mux_channel=MPU_CHANNEL)
         api.register_handle("imu", imu)
         info("BOOT: MPU-6050 initialized")
         diag("MPU CH={} ADDR={}".format(MPU_CHANNEL, hex(MPU_ADDR)))
@@ -1303,16 +1231,7 @@ async def main():
         warn("BOOT: MPU unavailable")
 
     try:
-        oled = OledStatus(
-            i2c_id=TCA_I2C_ID,
-            sda_gpio=TCA_SDA_GPIO,
-            scl_gpio=TCA_SCL_GPIO,
-            width=OLED_WIDTH,
-            height=OLED_HEIGHT,
-            addr=OLED_ADDR,
-            mux=mux,
-            mux_channel=OLED_CHANNEL,
-        )
+        oled = OledStatus(i2c_id=TCA_I2C_ID, sda_gpio=TCA_SDA_GPIO, scl_gpio=TCA_SCL_GPIO, width=OLED_WIDTH, height=OLED_HEIGHT, addr=OLED_ADDR, mux=mux, mux_channel=OLED_CHANNEL)
         if oled and oled.available:
             api.register_handle("oled", oled)
             oled.show_lines("ZebraBot", "Booting...", "OLED online")
@@ -1328,17 +1247,10 @@ async def main():
 
     _boot_oled(api, "ZebraBot", "Starting BLE", "")
     try:
-        teleop = BleTeleop(
-            drive=runtime_drive,
-            steering=steer,
-            imu=imu,
-            imu_period_ms=MPU_PERIOD_MS,
-            oled=oled,
-        )
+        teleop = BleTeleop(drive=runtime_drive, steering=steer, imu=imu, imu_period_ms=MPU_PERIOD_MS, oled=oled)
         api.register_handle("teleop", teleop)
         set_ble_sink(teleop)
         replay_boot_log()
-
         info("BOOT: BLE teleop initialized")
         state("BOOT", "ble_ok")
     except Exception as e:
@@ -1350,16 +1262,7 @@ async def main():
 
     try:
         notify_fn = teleop.notify_line if teleop is not None else None
-        sensor_hub = SensorHub(
-            i2c_id=TCA_I2C_ID,
-            sda_gpio=TCA_SDA_GPIO,
-            scl_gpio=TCA_SCL_GPIO,
-            freq=TCA_I2C_FREQ,
-            mux=mux,
-            port_modes=SENSOR_PORT_MODES,
-            notify_fn=notify_fn,
-            scan_period_ms=SENSOR_SCAN_PERIOD_MS,
-        )
+        sensor_hub = SensorHub(i2c_id=TCA_I2C_ID, sda_gpio=TCA_SDA_GPIO, scl_gpio=TCA_SCL_GPIO, freq=TCA_I2C_FREQ, mux=mux, port_modes=SENSOR_PORT_MODES, notify_fn=notify_fn, scan_period_ms=SENSOR_SCAN_PERIOD_MS)
         api.register_handle("sensor_hub", sensor_hub)
         info("BOOT: SensorHub initialized")
         state("BOOT", "sensorhub_ok")
@@ -1368,32 +1271,19 @@ async def main():
         sensor_hub = None
 
     _boot_oled(api, "ZebraBot", "Starting motors", "")
-
     try:
         motor_port_map = dict(MOTOR_PORT_MAP)
         motor_feedback = MotorFeedback(motor_port_map)
-        motor_scanner = MotorScanner(
-            motors=motors,
-            feedback=motor_feedback,
-            notify_fn=teleop.notify_line if teleop is not None else None,
-            ports=ACTIVE_MOTOR_PORTS,
-            scan_power=MOTOR_SCAN_POWER,
-            pulse_ms=MOTOR_SCAN_PULSE_MS,
-            period_ms=MOTOR_SCAN_PERIOD_MS,
-        )
-
+        motor_scanner = MotorScanner(motors=motors, feedback=motor_feedback, notify_fn=teleop.notify_line if teleop is not None else None, ports=tuple(sorted(MOTOR_PORT_MAP.keys())), scan_power=MOTOR_SCAN_POWER, pulse_ms=MOTOR_SCAN_PULSE_MS, period_ms=MOTOR_SCAN_PERIOD_MS)
         api.register_handle("motor_feedback", motor_feedback)
         api.register_handle("motor_scanner", motor_scanner)
-
         if teleop is not None:
             teleop.motor_feedback = motor_feedback
             teleop.motor_scanner = motor_scanner
             teleop.motor_ports = ACTIVE_MOTOR_PORTS
             teleop.motor_port_map = motor_port_map
-
         info("BOOT: motor feedback/scanner initialized")
         state("BOOT", "motor_scan_ok")
-
     except Exception as e:
         error("MOTOR_SCAN_INIT", e)
         motor_feedback = None
@@ -1430,13 +1320,18 @@ async def main():
         info("BOOT: IMU task skipped (no IMU)")
         state("TASK", "imu_skipped")
 
+    ENABLE_ACTIVE_MOTOR_SCAN = False
+
     if motor_scanner is not None:
-        try:
-            api.register_task("motor_scan", asyncio.create_task(motor_scanner.task()))
-            info("BOOT: MotorScanner task started")
-            state("TASK", "motor_scan_started")
-        except Exception as e:
-            error("MOTOR_SCAN_TASK", e)
+        if ENABLE_ACTIVE_MOTOR_SCAN:
+            try:
+                api.register_task("motor_scan", asyncio.create_task(motor_scanner.task()))
+                info("BOOT: MotorScanner task started")
+                state("TASK", "motor_scan_started")
+            except Exception as e:
+                error("MOTOR_SCAN_TASK", e)
+        else:
+            warn("BOOT: active motor scan disabled during user runtime")
 
         try:
             api.register_task(
@@ -1496,7 +1391,6 @@ def _safe_mode_requested():
 
 def boot():
     info("BOOT: main.py entry")
-
     if _safe_mode_requested():
         warn("BOOT: safe mode requested on GPIO{}; staying in REPL".format(SAFE_MODE_PIN))
         print("SAFE MODE: GPIO{} held low, normal boot skipped.".format(SAFE_MODE_PIN))
@@ -1511,7 +1405,6 @@ def boot():
         state("BOOT", "grace_{}".format(remaining))
         print("BOOT: launch in {}...".format(remaining))
         time.sleep(1)
-
     asyncio.run(main())
 
 

@@ -1,25 +1,34 @@
 # robot/config.py
+CONFIG_BUILD = "pin-table-2pin-motor-shared-actuator-v1"
 
 # ============================================================
-# MOTOR PORT DEFINITIONS (PHYSICAL PINOUT)
+# ACTUATOR / MOTOR PORT DEFINITIONS
 # ============================================================
+#
+# Pin table meaning:
+#   F = encoder/tick flag input
+#   D = motor direction output
+#   P = motor PWM output / servo signal output
+#
+# Motor ports and servo ports are the same physical actuator ports.
+# User code decides whether a port is used as a motor or as a servo.
 
-# M1
+# M1 header
 M1_ENC = 17
 M1_DIR = 16
 M1_PWM = 23
 
-# M2
+# M2 header
 M2_ENC = 34
 M2_DIR = 14
 M2_PWM = 13
 
-# M3
+# M3 header
 M3_ENC = 27
 M3_DIR = 26
 M3_PWM = 25
 
-# M4
+# M4 header
 M4_ENC = 35
 M4_DIR = 32
 M4_PWM = 33
@@ -32,59 +41,72 @@ M4_PWM = 33
 PORT_MAP = {
     1: {
         "name": "M1",
-        "pins": {"pwm": M1_PWM, "dir": M1_DIR, "enc": M1_ENC},
+        "pins": {"enc": M1_ENC, "dir": M1_DIR, "pwm": M1_PWM},
         "supports": ["dc_motor", "servo"],
         "default_mode": "dc_motor",
+        "invert_pwm": False,
     },
     2: {
         "name": "M2",
-        "pins": {"pwm": M2_PWM, "dir": M2_DIR, "enc": M2_ENC},
+        "pins": {"enc": M2_ENC, "dir": M2_DIR, "pwm": M2_PWM},
         "supports": ["dc_motor", "servo"],
         "default_mode": "dc_motor",
+        "invert_pwm": False,
     },
     3: {
         "name": "M3",
-        "pins": {"pwm": M3_PWM, "dir": M3_DIR, "enc": M3_ENC},
+        "pins": {"enc": M3_ENC, "dir": M3_DIR, "pwm": M3_PWM},
         "supports": ["dc_motor", "servo"],
         "default_mode": "dc_motor",
+        "invert_pwm": False,
     },
     4: {
         "name": "M4",
-        "pins": {"pwm": M4_PWM, "dir": M4_DIR, "enc": M4_ENC},
+        "pins": {"enc": M4_ENC, "dir": M4_DIR, "pwm": M4_PWM},
         "supports": ["dc_motor", "servo"],
         "default_mode": "dc_motor",
+        "invert_pwm": False,
     },
 }
 
 
 # ============================================================
-# LEGACY MOTOR PORT MAP COMPATIBILITY
+# MOTOR PORT MAP
 # ============================================================
+#
+# This board uses the 2-control-line motor model:
+#   pwm = speed/control signal
+#   dir = direction signal
+#   enc = optional encoder/tick flag input
+#
+# The old fwd/rev keys are intentionally not included here because F in the
+# table is not "forward"; it is the encoder/tick flag.
 
-# Keep this for older code paths that still expect flat pwm/dir/enc keys.
 MOTOR_PORT_MAP = {
     port: {
         "name": cfg["name"],
         "pwm": cfg["pins"]["pwm"],
         "dir": cfg["pins"]["dir"],
         "enc": cfg["pins"]["enc"],
+        "invert_pwm": bool(cfg.get("invert_pwm", False)),
     }
     for port, cfg in PORT_MAP.items()
 }
 
 
 # ============================================================
-# DRIVE TRAIN CONFIG
+# DRIVE TRAIN LEGACY DEFAULTS
 # ============================================================
+#
+# These are compatibility defaults only. User robot behavior belongs in
+# user_main.py, not here.
 
-# Which actuator ports are used for drive motion.
-DRIVE_MOTOR_PORTS = (1, 2)
-ACTIVE_MOTOR_PORTS = (1, 2, 3, 4)
+DRIVE_MOTOR_PORTS = tuple(sorted(MOTOR_PORT_MAP.keys()))
+ACTIVE_MOTOR_PORTS = DRIVE_MOTOR_PORTS
 
 LEFT_PORT = 1
 RIGHT_PORT = 2
 
-# Legacy aliases still used by current code.
 LEFT_PWM = MOTOR_PORT_MAP[LEFT_PORT]["pwm"]
 LEFT_DIR = MOTOR_PORT_MAP[LEFT_PORT]["dir"]
 LEFT_ENC = MOTOR_PORT_MAP[LEFT_PORT]["enc"]
@@ -98,31 +120,28 @@ RIGHT_ENC = MOTOR_PORT_MAP[RIGHT_PORT]["enc"]
 # SERVO CONFIG
 # ============================================================
 
-# Shared servo timing defaults.
 SERVO_FREQ_HZ = 50
 SERVO_MIN_US = 500
 SERVO_MAX_US = 2500
 SERVO_CENTER_DEG = 90
 
-# Steering is a ROLE bound to a port, not a dedicated pin.
-STEER_SERVO_PORT = 1
-
-# Backward-compatible servo map for generic servo registration.
+# Motor ports and servo ports are the same physical actuator ports.
+# Servo signal uses the same P/PWM pin for each actuator port.
 SERVO_PORT_MAP = {
     port: {
         "name": "{}_SERVO".format(cfg["name"]),
-        "gpio": cfg["pins"]["pwm"],
+        "gpio": cfg["pwm"],
         "freq_hz": SERVO_FREQ_HZ,
         "min_us": SERVO_MIN_US,
         "max_us": SERVO_MAX_US,
         "center_deg": SERVO_CENTER_DEG,
-        "role": "steering" if port == STEER_SERVO_PORT else "",
+        "role": "",
     }
-    for port, cfg in PORT_MAP.items()
+    for port, cfg in MOTOR_PORT_MAP.items()
 }
 
-# Legacy compatibility only.
-# Do not use this for new code. It points to the steering port PWM pin.
+# Legacy fallback only. User code should call zbot.servo(port) directly.
+STEER_SERVO_PORT = 1
 STEER_SERVO_GPIO = SERVO_PORT_MAP[STEER_SERVO_PORT]["gpio"]
 
 
@@ -205,10 +224,16 @@ MOTOR_SCAN_PULSE_MS = 250
 MOTOR_SCAN_PERIOD_MS = 1500
 MOTOR_FEEDBACK_PERIOD_MS = 200
 
+
 # ============================================================
-# BUTTON IO Settings
+# BUTTON IO SETTINGS
 # ============================================================
 
-BUTTON0_IO  = 15
-BUTTON0_IO  = 12
-PULLDOWN = TRUE
+BUTTON0_IO = 15
+BUTTON1_IO = 12
+PULLDOWN = False
+
+BUTTON_MAP = {
+    1: {"name": "B1", "gpio": BUTTON0_IO, "pull": "down", "active_low": False},
+    2: {"name": "B2", "gpio": BUTTON1_IO, "pull": "down", "active_low": False},
+}

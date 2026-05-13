@@ -4,6 +4,12 @@ import sys
 import bluetooth
 import uasyncio as asyncio
 import ubinascii
+import time
+
+try:
+    import gc
+except Exception:
+    gc = None
 from micropython import const
 
 from .config import BLE_NAME, SERVO_CENTER_DEG
@@ -87,8 +93,7 @@ def _mkdirs(path):
 
 class BleTeleop:
     def __init__(self, drive, steering, imu=None, imu_period_ms=10, oled=None):
-        self._ble = bluetooth.BLE()
-        self._ble.active(True)
+        self._ble = self._init_ble_controller()
         self._ble.irq(self._irq)
 
         ((self._tx_handle, self._rx_handle),) = self._ble.gatts_register_services((_UART_SERVICE,))
@@ -157,6 +162,53 @@ class BleTeleop:
             asyncio.create_task(self._tx_task())
         except Exception as e:
             print("BLE task start failed:", e)
+
+    def _init_ble_controller(self):
+        """
+        Bring the MicroPython BLE controller into a clean active state.
+
+        Some ESP32 builds occasionally raise OSError(116) / ETIMEDOUT when
+        active(True) is called while the controller is still settling from a
+        previous soft reset, failed advertisement, or interrupted BLE session.
+        Deactivating first and giving the controller a short pause makes boot
+        more reliable while still letting main.py decide whether to retry or
+        continue without BLE.
+        """
+        ble = bluetooth.BLE()
+
+        try:
+            ble.active(False)
+        except Exception:
+            pass
+
+        try:
+            if gc is not None:
+                gc.collect()
+        except Exception:
+            pass
+
+        try:
+            time.sleep_ms(120)
+        except Exception:
+            pass
+
+        try:
+            ble.active(True)
+        except Exception:
+            # Try to leave the controller in a known inactive state before the
+            # exception bubbles up to main.py's BLE retry/fallback logic.
+            try:
+                ble.active(False)
+            except Exception:
+                pass
+            raise
+
+        try:
+            time.sleep_ms(40)
+        except Exception:
+            pass
+
+        return ble
 
     def _set_steering_angle(self, angle):
         if self.steering is None:
@@ -242,33 +294,18 @@ class BleTeleop:
                 print("BLE advertise failed:", first_err, second_err)
 
     def _cancel_oled_msg(self):
-        try:
-            if self._oled_msg_task is not None:
-                self._oled_msg_task.cancel()
-        except Exception:
-            pass
+        # OLED ownership lives in main.py's OLED status task.
+        # BLE must not directly cancel, clear, or write to the physical display.
         self._oled_msg_task = None
 
     def _oled_temp_message(self, *lines, hold_ms=800, clear_after=True):
-        if not self.oled:
-            return
-        self._cancel_oled_msg()
-        try:
-            self._oled_msg_task = asyncio.create_task(
-                self._oled_temp_message_task(lines, hold_ms, clear_after)
-            )
-        except Exception as e:
-            self.notify_error("OLED_TEMP", e)
+        # Kept as a compatibility no-op for older call sites.
+        # Use notify_line()/notify_info() for BLE/serial status instead.
+        return
 
     async def _oled_temp_message_task(self, lines, hold_ms, clear_after):
-        try:
-            if self.oled:
-                self.oled.show_lines(*lines)
-                await asyncio.sleep_ms(int(hold_ms))
-                if clear_after:
-                    self.oled.clear()
-        except Exception as e:
-            self.notify_error("OLED_TEMP_TASK", e)
+        # Compatibility no-op: main.py owns OLED rendering.
+        return
 
     async def _housekeeping(self):
         while True:
@@ -357,27 +394,15 @@ class BleTeleop:
             self.notify_line("WARN TX dropped {}".format(self._tx_drop_count))
             self._tx_drop_count = 0
 
-        if self.oled:
-            try:
-                self.oled.flash_connected()
-                try:
-                    asyncio.create_task(self._clear_oled_after_connect())
-                except Exception as e:
-                    self.notify_error("OLED_CLEAR_SCHED", e)
-            except Exception as e:
-                self.notify_error("OLED_FLASH", e)
-
+        # Do not touch the OLED here. main.py owns display rendering so BLE
+        # connection events cannot overwrite user program display output.
         self._emit_motor_config()
         if self._motor_fb_enabled:
             self._emit_motor_snapshot()
 
     async def _clear_oled_after_connect(self):
-        try:
-            await asyncio.sleep_ms(1800)
-            if self.oled:
-                self.oled.clear()
-        except Exception as e:
-            self.notify_error("OLED_CLEAR", e)
+        # Compatibility no-op: main.py owns OLED rendering.
+        return
 
     def _on_disconnected(self):
         print("BLE disconnected")
@@ -394,9 +419,7 @@ class BleTeleop:
             except Exception as e:
                 self.notify_error("STEER_CENTER", e)
 
-        if self.oled:
-            self._oled_temp_message("ZebraBot", "Disconnected", hold_ms=700, clear_after=True)
-
+        # Do not touch the OLED here. main.py owns display rendering.
         self._ble_motion_active = False
         self._tx_queue = []
         self._rx_buf = b""
