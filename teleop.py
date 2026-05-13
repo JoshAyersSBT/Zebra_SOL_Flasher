@@ -37,6 +37,128 @@ import os
 import sys
 
 
+POST_JOB_SERIAL_CAPTURE_SECONDS = 90.0
+DEFAULT_SERIAL_MONITOR_BAUD = 115200
+
+LOG_LEVEL_STYLES = {
+    "error": "color:#ff7b72; font-weight:700;",
+    "warning": "color:#f2cc60; font-weight:700;",
+    "success": "color:#7ee787; font-weight:700;",
+    "command": "color:#79c0ff;",
+    "serial": "color:#c9d1d9;",
+    "ble": "color:#d2a8ff;",
+    "info": "color:#9fc4ff;",
+    "state": "color:#7dd3fc; font-weight:700;",
+    "boot": "color:#a5b4fc; font-weight:700;",
+    "task": "color:#c084fc; font-weight:700;",
+    "sensor": "color:#86efac; font-weight:700;",
+    "motor": "color:#fdba74; font-weight:700;",
+    "debug": "color:#94a3b8;",
+    "heartbeat": "color:#64748b;",
+}
+
+
+def _strip_log_prefixes(text: str) -> str:
+    """Remove common transport prefixes so device-side categories are detected."""
+    s = str(text or "").strip()
+    changed = True
+    prefixes = ("[SERIAL]", "[ROBOT]", "[ROBOT RAW]", "[ROBOT ERROR]", "RX<-", "TX->")
+    while changed:
+        changed = False
+        for prefix in prefixes:
+            if s.startswith(prefix):
+                s = s[len(prefix):].strip()
+                changed = True
+    return s
+
+
+def classify_log_line(line: str) -> str:
+    """Return a display category for a teleop/serial log line."""
+    text = str(line or "")
+    low = text.lower()
+    stripped = text.strip()
+    inner = _strip_log_prefixes(text)
+    inner_low = inner.lower()
+
+    error_terms = (
+        "❌", "traceback", "error", " err ", "[err]", " err_", "exception",
+        "failed", "failure", "critical", "oserror", "typeerror", "attributeerror",
+        "syntaxerror", "memoryerror", "runtimeerror", "controller error", "service error",
+        "read failed", "scan error", "operation failed",
+    )
+    warning_terms = (
+        "warn", "warning", "timed out", "timeout", "skipped", "unavailable",
+        "not found", "exists or not supported", "continuing", "canceled",
+    )
+    success_terms = (
+        "✅", "complete", "completed", "success", "connected", "found ",
+        "selected", "uploaded", "ready", "done", "created",
+    )
+
+    if any(term in low for term in error_terms) or inner.startswith(("ERR", "[ERR]", "BOOT DEMO ERROR")):
+        return "error"
+    if any(term in low for term in warning_terms) or inner.startswith(("WARN", "[WARN]", "W ")):
+        return "warning"
+
+    # Device-side status categories. These are checked after errors/warnings so
+    # lines like "STATE BOOT ble_failed" still show as errors, while normal
+    # status lines get distinct readable colors instead of plain serial white.
+    if inner.startswith(("STATE SYS heartbeat", "SYS heartbeat")):
+        return "heartbeat"
+    if inner.startswith(("STATE BOOT", "BOOT", "[INFO] BOOT")):
+        return "boot"
+    if inner.startswith(("STATE TASK", "TASK")):
+        return "task"
+    if inner.startswith(("STATE ",)):
+        return "state"
+    if inner.startswith(("[INFO]", "INFO", "I ")):
+        if "sensor" in inner_low or inner.startswith(("SNS", "SNS_")):
+            return "sensor"
+        if "motor" in inner_low or inner.startswith(("MTR", "MTR_")):
+            return "motor"
+        return "info"
+    if inner.startswith(("[DEBUG]", "DEBUG", "D ")):
+        return "debug"
+    if inner.startswith(("SNS", "SNS_")) or "sensor" in inner_low:
+        return "sensor"
+    if inner.startswith(("MTR", "MTR_")) or "motor" in inner_low:
+        return "motor"
+
+    if stripped.startswith((">>", "->", "TX:", "TX->")):
+        return "command"
+    if "ble" in low or stripped.startswith(("RX<-", "[ROBOT", "NUS")):
+        return "ble"
+    if any(term in low for term in success_terms):
+        return "success"
+    if stripped.startswith("[SERIAL]"):
+        return "serial"
+    return "info"
+
+def rich_log_html(line: str) -> str:
+    """Convert a single plain-text log line into safe, colorized rich text."""
+    category = classify_log_line(line)
+    style = LOG_LEVEL_STYLES.get(category, LOG_LEVEL_STYLES["info"])
+    escaped = html.escape(str(line)).replace(" ", "&nbsp;")
+    return f"<div style='white-space:pre-wrap; font-family:Consolas, monospace; {style}'>{escaped}</div>"
+
+
+def append_rich_log(widget: QTextEdit, text: str) -> None:
+    """Append text to a QTextEdit while preserving spacing and coloring by category."""
+    if widget is None:
+        return
+    raw = str(text or "")
+    if raw == "":
+        widget.append("")
+        return
+    for line in raw.splitlines() or [raw]:
+        widget.append(rich_log_html(line))
+    try:
+        bar = widget.verticalScrollBar()
+        bar.setValue(bar.maximum())
+    except Exception:
+        pass
+
+
 def app_root_dir() -> Path:
     return Path(__file__).resolve().parent
 
@@ -926,7 +1048,7 @@ class SerialMonitorWorker(QThread):
     log = pyqtSignal(str)
     status = pyqtSignal(str)
 
-    def __init__(self, port: str, baud: int = 115200, duration_s: float = 15.0):
+    def __init__(self, port: str, baud: int = DEFAULT_SERIAL_MONITOR_BAUD, duration_s: float = POST_JOB_SERIAL_CAPTURE_SECONDS):
         super().__init__()
         self.port = str(port or "").strip()
         self.baud = int(baud)
@@ -1042,7 +1164,7 @@ class JobStatusDialog(QDialog):
         self.activateWindow()
 
     def append_log(self, text: str):
-        self.log_view.append(text)
+        append_rich_log(self.log_view, text)
 
     def update_progress(self, current: int, total: int, label: str = ""):
         total = max(1, int(total))
@@ -1060,7 +1182,7 @@ class JobStatusDialog(QDialog):
         if ok:
             self.progress_bar.setValue(self.progress_bar.maximum())
         if message:
-            self.log_view.append(("✅ " if ok else "❌ ") + message)
+            self.append_log(("✅ " if ok else "❌ ") + message)
 
 
 class DeviceSelectionDialog(QDialog):
@@ -1495,7 +1617,7 @@ class FlashDeployTab(QWidget):
         self.deploy_progress.setValue(0)
 
         self.serial_log_hint = QLabel(
-            "After serial flash or deploy, teleop will briefly open the serial port and stream boot logs and Python tracebacks here automatically."
+            "After serial flash or deploy, teleop opens the serial port for about 90 seconds and streams boot logs, warnings, errors, and Python tracebacks here automatically."
         )
         self.serial_log_hint.setWordWrap(True)
 
@@ -1524,7 +1646,7 @@ class FlashDeployTab(QWidget):
         self.scan_timer.start()
 
     def append_log(self, text: str):
-        self.log.append(text)
+        append_rich_log(self.log, text)
 
     def on_deploy_method_changed(self):
         is_serial = self.deploy_method.currentData() == "serial"
@@ -1565,12 +1687,12 @@ class FlashDeployTab(QWidget):
                 pass
             self.serial_monitor = None
 
-    def start_serial_monitor(self, port: str, baud: int = 115200, duration_s: float = 15.0):
+    def start_serial_monitor(self, port: str, baud: int = DEFAULT_SERIAL_MONITOR_BAUD, duration_s: float = POST_JOB_SERIAL_CAPTURE_SECONDS):
         port = (port or "").strip()
         if not port or port.upper() in {"AUTO", "AUTO-DETECT", "AUTODETECT"}:
             return
         self.stop_serial_monitor()
-        self.append_log(f"Starting post-flash serial log capture on {port}...")
+        self.append_log(f"Starting post-flash serial log capture on {port} for {duration_s:.0f} seconds...")
         self.serial_monitor = SerialMonitorWorker(port=port, baud=baud, duration_s=duration_s)
         self.serial_monitor.log.connect(self.append_log)
         self.serial_monitor.log.connect(self.status_dialog.append_log)
@@ -1915,8 +2037,12 @@ class FlashDeployTab(QWidget):
             self.deploy_progress_label.setText(msg or "Upload complete.")
             self.append_log(f"✅ {msg}")
             if finished_job is not None and finished_job.kind in {"flash", "deploy"}:
-                serial_baud = 115200
-                self.start_serial_monitor(finished_job.port, baud=serial_baud, duration_s=20.0)
+                serial_baud = DEFAULT_SERIAL_MONITOR_BAUD
+                self.start_serial_monitor(
+                    finished_job.port,
+                    baud=serial_baud,
+                    duration_s=POST_JOB_SERIAL_CAPTURE_SECONDS,
+                )
         else:
             self.deploy_progress_label.setText(msg or "Operation failed.")
             self.append_log(f"❌ {msg}")
@@ -2160,7 +2286,7 @@ class BleTeleopTab(QWidget):
         self.log_box = QTextEdit()
         self.log_box.setReadOnly(True)
         self.log_box.setStyleSheet("font-family: Consolas, monospace;")
-        self.log.connect(self.log_box.append)
+        self.log.connect(lambda text: append_rich_log(self.log_box, text))
 
         root.addWidget(title)
         root.addWidget(self.status)
